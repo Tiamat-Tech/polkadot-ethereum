@@ -3,24 +3,23 @@ package beefy
 import (
 	"context"
 	"fmt"
+	"time"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/snowfork/go-substrate-rpc-client/v4/types"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/snowfork/snowbridge/relayer/chain/relaychain"
 	"github.com/snowfork/snowbridge/relayer/substrate"
-
-	log "github.com/sirupsen/logrus"
 )
 
 type PolkadotListener struct {
-	config              *Config
-	conn                *relaychain.Connection
-	beefyAuthoritiesKey types.StorageKey
+	config *SourceConfig
+	conn   *relaychain.Connection
 }
 
 func NewPolkadotListener(
-	config *Config,
+	config *SourceConfig,
 	conn *relaychain.Connection,
 ) *PolkadotListener {
 	return &PolkadotListener{
@@ -33,19 +32,12 @@ func (li *PolkadotListener) Start(
 	ctx context.Context,
 	eg *errgroup.Group,
 	currentBeefyBlock uint64,
-	currentValidatorSetID uint64,
 ) (<-chan Request, error) {
-	storageKey, err := types.CreateStorageKey(li.conn.Metadata(), "Beefy", "Authorities", nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	li.beefyAuthoritiesKey = storageKey
-
-	requests := make(chan Request)
+	requests := make(chan Request, 1)
 
 	eg.Go(func() error {
 		defer close(requests)
-		err := li.scanCommitments(ctx, currentBeefyBlock, currentValidatorSetID, requests)
+		err := li.scanCommitments(ctx, currentBeefyBlock, requests)
 		if err != nil {
 			return err
 		}
@@ -58,12 +50,11 @@ func (li *PolkadotListener) Start(
 func (li *PolkadotListener) scanCommitments(
 	ctx context.Context,
 	currentBeefyBlock uint64,
-	currentValidatorSet uint64,
 	requests chan<- Request,
 ) error {
-	in, err := ScanSafeCommitments(ctx, li.conn.Metadata(), li.conn.API(), currentBeefyBlock+1, li.config.Source.BeefyActivationBlock)
+	in, err := ScanCommitments(ctx, li.conn.Metadata(), li.conn.API(), currentBeefyBlock+1)
 	if err != nil {
-		return fmt.Errorf("scan commitments: %w", err)
+		return fmt.Errorf("scan provable commitments: %w", err)
 	}
 
 	for {
@@ -78,83 +69,45 @@ func (li *PolkadotListener) scanCommitments(
 				return fmt.Errorf("scan safe commitments: %w", result.Error)
 			}
 
-			if result.SignedCommitment.Commitment.ValidatorSetID == currentValidatorSet+1 {
-				// Workaround for https://github.com/paritytech/polkadot/pull/6577
-				if uint64(result.MMRProof.Leaf.BeefyNextAuthoritySet.ID) != result.SignedCommitment.Commitment.ValidatorSetID+1 {
-					log.WithFields(log.Fields{
-						"commitment": log.Fields{
-							"blockNumber":    result.SignedCommitment.Commitment.BlockNumber,
-							"validatorSetID": result.SignedCommitment.Commitment.ValidatorSetID,
-						},
-					}).Info("Discarded invalid handover commitment with BeefyNextAuthoritySet not change")
-					continue
-				}
-				currentValidatorSet++
-				validators, err := li.queryBeefyAuthorities(result.BlockHash)
-				if err != nil {
-					return fmt.Errorf("fetch beefy authorities at block %v: %w", result.BlockHash, err)
-				}
+			committedBeefyBlock := uint64(result.SignedCommitment.Commitment.BlockNumber)
+			validatorSetID := result.SignedCommitment.Commitment.ValidatorSetID
+			nextValidatorSetID := uint64(result.Proof.Leaf.BeefyNextAuthoritySet.ID)
 
-				task := Request{
-					Validators:       validators,
-					SignedCommitment: result.SignedCommitment,
-					Proof:            result.MMRProof,
-					IsHandover:       true,
-				}
+			validators, err := li.queryBeefyAuthorities(result.BlockHash)
+			if err != nil {
+				return fmt.Errorf("fetch beefy authorities at block %v: %w", result.BlockHash, err)
+			}
 
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case requests <- task:
-				}
-			} else if result.SignedCommitment.Commitment.ValidatorSetID == currentValidatorSet {
-				if result.Depth > li.config.Source.FastForwardDepth {
-					log.WithFields(log.Fields{
-						"commitment": log.Fields{
-							"blockNumber":    result.SignedCommitment.Commitment.BlockNumber,
-							"validatorSetID": result.SignedCommitment.Commitment.ValidatorSetID,
-						},
-					}).Warn("Discarded commitment with depth not fast forward")
-					continue
-				}
+			task := Request{
+				Validators:       validators,
+				SignedCommitment: result.SignedCommitment,
+				Proof:            result.Proof,
+			}
 
-				validators, err := li.queryBeefyAuthorities(result.BlockHash)
-				if err != nil {
-					return fmt.Errorf("fetch beefy authorities at block %v: %w", result.BlockHash, err)
-				}
+			log.WithFields(log.Fields{
+				"commitment": log.Fields{
+					"blockNumber":        committedBeefyBlock,
+					"validatorSetID":     validatorSetID,
+					"nextValidatorSetID": nextValidatorSetID,
+				},
+			}).Info("Sending BEEFY commitment to ethereum writer")
 
-				task := Request{
-					Validators:       validators,
-					SignedCommitment: result.SignedCommitment,
-					Proof:            result.MMRProof,
-					IsHandover:       false,
-				}
-
-				// drop task if it can't be processed immediately
-				select {
-				case requests <- task:
-				default:
-					log.WithFields(log.Fields{
-						"commitment": log.Fields{
-							"blockNumber":    result.SignedCommitment.Commitment.BlockNumber,
-							"validatorSetID": result.SignedCommitment.Commitment.ValidatorSetID,
-						},
-					}).Info("Discarded commitment")
-				}
-			} else {
-				return fmt.Errorf("commitment has unexpected validatorSetID: blockNumber=%v validatorSetID=%v expectedValidatorSetID=%v",
-					result.SignedCommitment.Commitment.BlockNumber,
-					result.SignedCommitment.Commitment.ValidatorSetID,
-					currentValidatorSet,
-				)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case requests <- task:
 			}
 		}
 	}
 }
 
 func (li *PolkadotListener) queryBeefyAuthorities(blockHash types.Hash) ([]substrate.Authority, error) {
+	storageKey, err := types.CreateStorageKey(li.conn.Metadata(), "Beefy", "Authorities", nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create storage key: %w", err)
+	}
 	var authorities []substrate.Authority
-	ok, err := li.conn.API().RPC.State.GetStorage(li.beefyAuthoritiesKey, &authorities, blockHash)
+	ok, err := li.conn.API().RPC.State.GetStorage(storageKey, &authorities, blockHash)
 	if err != nil {
 		return nil, err
 	}
@@ -165,16 +118,96 @@ func (li *PolkadotListener) queryBeefyAuthorities(blockHash types.Hash) ([]subst
 	return authorities, nil
 }
 
-func (li *PolkadotListener) queryBeefyNextAuthoritySet(blockHash types.Hash) (types.BeefyNextAuthoritySet, error) {
-	var nextAuthoritySet types.BeefyNextAuthoritySet
-	storageKey, err := types.CreateStorageKey(li.conn.Metadata(), "MmrLeaf", "BeefyNextAuthorities", nil, nil)
-	ok, err := li.conn.API().RPC.State.GetStorage(storageKey, &nextAuthoritySet, blockHash)
+func (li *PolkadotListener) generateBeefyUpdate(relayBlockNumber uint64) (Request, error) {
+	api := li.conn.API()
+	meta := li.conn.Metadata()
+	var request Request
+	beefyBlockHash, err := li.findNextBeefyBlock(relayBlockNumber)
 	if err != nil {
-		return nextAuthoritySet, err
-	}
-	if !ok {
-		return nextAuthoritySet, fmt.Errorf("beefy nextAuthoritySet not found")
+		return request, fmt.Errorf("find match beefy block: %w", err)
 	}
 
-	return nextAuthoritySet, nil
+	commitment, proof, err := fetchCommitmentAndProof(meta, api, beefyBlockHash)
+	if err != nil {
+		return request, fmt.Errorf("fetch commitment and proof: %w", err)
+	}
+
+	committedBeefyBlockNumber := uint64(commitment.Commitment.BlockNumber)
+	committedBeefyBlockHash, err := api.RPC.Chain.GetBlockHash(uint64(committedBeefyBlockNumber))
+
+	validators, err := li.queryBeefyAuthorities(committedBeefyBlockHash)
+	if err != nil {
+		return request, fmt.Errorf("fetch beefy authorities at block %v: %w", committedBeefyBlockHash, err)
+	}
+	request = Request{
+		Validators:       validators,
+		SignedCommitment: *commitment,
+		Proof:            *proof,
+	}
+
+	return request, nil
+}
+
+func (li *PolkadotListener) findNextBeefyBlock(blockNumber uint64) (types.Hash, error) {
+	api := li.conn.API()
+	var nextBeefyBlockHash, finalizedBeefyBlockHash types.Hash
+	var err error
+	nextBeefyBlockNumber := blockNumber
+	for {
+		finalizedBeefyBlockHash, err = api.RPC.Beefy.GetFinalizedHead()
+		if err != nil {
+			return nextBeefyBlockHash, fmt.Errorf("fetch beefy finalized head: %w", err)
+		}
+		finalizedBeefyBlockHeader, err := api.RPC.Chain.GetHeader(finalizedBeefyBlockHash)
+		if err != nil {
+			return nextBeefyBlockHash, fmt.Errorf("fetch block header: %w", err)
+		}
+		latestBeefyBlockNumber := uint64(finalizedBeefyBlockHeader.Number)
+		if latestBeefyBlockNumber <= nextBeefyBlockNumber {
+			// The relay block not finalized yet, just wait and retry
+			time.Sleep(6 * time.Second)
+			continue
+		} else if latestBeefyBlockNumber <= nextBeefyBlockNumber+600 {
+			// The relay block has been finalized not long ago(1 hour), just return the finalized block
+			nextBeefyBlockHash = finalizedBeefyBlockHash
+			break
+		} else {
+			// The relay block has been finalized for a long time, in this case return the next block
+			// which contains a beefy justification
+			for {
+				if nextBeefyBlockNumber == latestBeefyBlockNumber {
+					nextBeefyBlockHash = finalizedBeefyBlockHash
+					break
+				}
+				nextBeefyBlockHash, err = api.RPC.Chain.GetBlockHash(nextBeefyBlockNumber)
+				if err != nil {
+					return nextBeefyBlockHash, fmt.Errorf("fetch block hash: %w", err)
+				}
+				block, err := api.RPC.Chain.GetBlock(nextBeefyBlockHash)
+				if err != nil {
+					return nextBeefyBlockHash, fmt.Errorf("fetch block: %w", err)
+				}
+
+				var commitment *types.SignedCommitment
+				for j := range block.Justifications {
+					sc := types.OptionalSignedCommitment{}
+					if block.Justifications[j].EngineID() == "BEEF" {
+						err := types.DecodeFromBytes(block.Justifications[j].Payload(), &sc)
+						if err != nil {
+							return nextBeefyBlockHash, fmt.Errorf("decode BEEFY signed commitment: %w", err)
+						}
+						ok, value := sc.Unwrap()
+						if ok {
+							commitment = &value
+						}
+					}
+				}
+				if commitment != nil {
+					return nextBeefyBlockHash, nil
+				}
+				nextBeefyBlockNumber++
+			}
+		}
+	}
+	return nextBeefyBlockHash, nil
 }

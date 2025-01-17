@@ -2,6 +2,8 @@ package parachain
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -9,6 +11,7 @@ import (
 	"github.com/snowfork/snowbridge/relayer/chain/parachain"
 	"github.com/snowfork/snowbridge/relayer/chain/relaychain"
 	"github.com/snowfork/snowbridge/relayer/crypto/secp256k1"
+	"github.com/snowfork/snowbridge/relayer/ofac"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -17,7 +20,8 @@ type Relay struct {
 	config                *Config
 	parachainConn         *parachain.Connection
 	relaychainConn        *relaychain.Connection
-	ethereumConn          *ethereum.Connection
+	ethereumConnWriter    *ethereum.Connection
+	ethereumConnBeefy     *ethereum.Connection
 	ethereumChannelWriter *EthereumWriter
 	beefyListener         *BeefyListener
 }
@@ -28,15 +32,17 @@ func NewRelay(config *Config, keypair *secp256k1.Keypair) (*Relay, error) {
 	parachainConn := parachain.NewConnection(config.Source.Parachain.Endpoint, nil)
 	relaychainConn := relaychain.NewConnection(config.Source.Polkadot.Endpoint)
 
-	// TODO: This is used by both the source & sink. They should use separate connections
-	ethereumConn := ethereum.NewConnection(config.Sink.Ethereum.Endpoint, keypair)
+	ethereumConnWriter := ethereum.NewConnection(&config.Sink.Ethereum, keypair)
+	ethereumConnBeefy := ethereum.NewConnection(&config.Source.Ethereum, keypair)
+
+	ofacClient := ofac.New(config.OFAC.Enabled, config.OFAC.ApiKey)
 
 	// channel for messages from beefy listener to ethereum writer
 	var tasks = make(chan *Task, 1)
 
 	ethereumChannelWriter, err := NewEthereumWriter(
 		&config.Sink,
-		ethereumConn,
+		ethereumConnWriter,
 		tasks,
 	)
 	if err != nil {
@@ -45,9 +51,11 @@ func NewRelay(config *Config, keypair *secp256k1.Keypair) (*Relay, error) {
 
 	beefyListener := NewBeefyListener(
 		&config.Source,
-		ethereumConn,
+		&config.Schedule,
+		ethereumConnBeefy,
 		relaychainConn,
 		parachainConn,
+		ofacClient,
 		tasks,
 	)
 
@@ -55,24 +63,30 @@ func NewRelay(config *Config, keypair *secp256k1.Keypair) (*Relay, error) {
 		config:                config,
 		parachainConn:         parachainConn,
 		relaychainConn:        relaychainConn,
-		ethereumConn:          ethereumConn,
+		ethereumConnWriter:    ethereumConnWriter,
+		ethereumConnBeefy:     ethereumConnBeefy,
 		ethereumChannelWriter: ethereumChannelWriter,
 		beefyListener:         beefyListener,
 	}, nil
 }
 
 func (relay *Relay) Start(ctx context.Context, eg *errgroup.Group) error {
-	err := relay.parachainConn.Connect(ctx)
+	err := relay.parachainConn.ConnectWithHeartBeat(ctx, 30*time.Second)
 	if err != nil {
 		return err
 	}
 
-	err = relay.ethereumConn.Connect(ctx)
+	err = relay.ethereumConnWriter.Connect(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to connect to ethereum: writer: %w", err)
 	}
 
-	err = relay.relaychainConn.Connect(ctx)
+	err = relay.ethereumConnBeefy.Connect(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to connect to ethereum: beefy: %w", err)
+	}
+
+	err = relay.relaychainConn.ConnectWithHeartBeat(ctx, 30*time.Second)
 	if err != nil {
 		return err
 	}
@@ -88,6 +102,8 @@ func (relay *Relay) Start(ctx context.Context, eg *errgroup.Group) error {
 	if err != nil {
 		return err
 	}
+
+	log.Info("Current relay's ID:", relay.config.Schedule.ID)
 
 	return nil
 }

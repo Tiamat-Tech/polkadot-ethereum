@@ -2,11 +2,16 @@ package parachain
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"reflect"
+	"strings"
 	"syscall"
 
+	"github.com/mitchellh/mapstructure"
 	"github.com/sirupsen/logrus"
 	"github.com/snowfork/snowbridge/relayer/chain/ethereum"
 	"github.com/snowfork/snowbridge/relayer/relays/parachain"
@@ -19,6 +24,7 @@ var (
 	configFile     string
 	privateKey     string
 	privateKeyFile string
+	privateKeyID   string
 )
 
 func Command() *cobra.Command {
@@ -34,6 +40,7 @@ func Command() *cobra.Command {
 
 	cmd.Flags().StringVar(&privateKey, "ethereum.private-key", "", "Ethereum private key")
 	cmd.Flags().StringVar(&privateKeyFile, "ethereum.private-key-file", "", "The file from which to read the private key")
+	cmd.Flags().StringVar(&privateKeyID, "ethereum.private-key-id", "", "The secret id to lookup the private key in AWS Secrets Manager")
 
 	return cmd
 }
@@ -48,12 +55,17 @@ func run(_ *cobra.Command, _ []string) error {
 	}
 
 	var config parachain.Config
-	err := viper.Unmarshal(&config)
+	err := viper.UnmarshalExact(&config, viper.DecodeHook(HexHookFunc()))
 	if err != nil {
 		return err
 	}
 
-	keypair, err := ethereum.ResolvePrivateKey(privateKey, privateKeyFile)
+	err = config.Validate()
+	if err != nil {
+		return fmt.Errorf("config file validation failed: %w", err)
+	}
+
+	keypair, err := ethereum.ResolvePrivateKey(privateKey, privateKeyFile, privateKeyID)
 	if err != nil {
 		return err
 	}
@@ -96,4 +108,50 @@ func run(_ *cobra.Command, _ []string) error {
 	}
 
 	return nil
+}
+
+func HexHookFunc() mapstructure.DecodeHookFuncType {
+	return func(
+		f reflect.Type,
+		t reflect.Type,
+		data interface{},
+	) (interface{}, error) {
+		// Check that the data is string
+		if f.Kind() != reflect.String {
+			return data, nil
+		}
+
+		// Check that the target type is our custom type
+		if t != reflect.TypeOf(parachain.ChannelID{}) {
+			return data, nil
+		}
+
+		foo, err := HexDecodeString(data.(string))
+		if err != nil {
+			return nil, err
+		}
+
+		var out [32]byte
+		copy(out[:], foo)
+
+		// Return the parsed value
+		return parachain.ChannelID(out), nil
+	}
+}
+
+// HexDecodeString decodes bytes from a hex string. Contrary to hex.DecodeString, this function does not error if "0x"
+// is prefixed, and adds an extra 0 if the hex string has an odd length.
+func HexDecodeString(s string) ([]byte, error) {
+	s = strings.TrimPrefix(s, "0x")
+
+	if len(s)%2 != 0 {
+		s = "0" + s
+	}
+
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
 }

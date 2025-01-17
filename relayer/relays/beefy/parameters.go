@@ -1,27 +1,31 @@
 package beefy
 
 import (
-	"bytes"
+	"encoding/hex"
 	"fmt"
 	"math/big"
 
+	"github.com/holiman/uint256"
+	"github.com/sirupsen/logrus"
 	"github.com/snowfork/go-substrate-rpc-client/v4/types"
-	"github.com/snowfork/snowbridge/relayer/contracts/beefyclient"
+	"github.com/snowfork/snowbridge/relayer/contracts"
 	"github.com/snowfork/snowbridge/relayer/crypto/keccak"
 	"github.com/snowfork/snowbridge/relayer/crypto/merkle"
+	"github.com/snowfork/snowbridge/relayer/relays/util"
+	"golang.org/x/exp/slices"
 )
 
 type InitialRequestParams struct {
-	CommitmentHash [32]byte
-	Bitfield       []*big.Int
-	Proof          beefyclient.BeefyClientValidatorProof
+	Commitment contracts.BeefyClientCommitment
+	Bitfield   []*big.Int
+	Proof      contracts.BeefyClientValidatorProof
 }
 
 type FinalRequestParams struct {
-	Commitment     beefyclient.BeefyClientCommitment
+	Commitment     contracts.BeefyClientCommitment
 	Bitfield       []*big.Int
-	Proofs         []beefyclient.BeefyClientValidatorProof
-	Leaf           beefyclient.BeefyClientMMRLeaf
+	Proofs         []contracts.BeefyClientValidatorProof
+	Leaf           contracts.BeefyClientMMRLeaf
 	LeafProof      [][32]byte
 	LeafProofOrder *big.Int
 }
@@ -43,10 +47,7 @@ func (r *Request) CommitmentHash() (*[32]byte, error) {
 // Generate RequestParams which contains merkle proof by validator's index
 // together with the signature which will be verified in BeefyClient contract later
 func (r *Request) MakeSubmitInitialParams(valAddrIndex int64, initialBitfield []*big.Int) (*InitialRequestParams, error) {
-	commitmentHash, err := r.CommitmentHash()
-	if err != nil {
-		return nil, fmt.Errorf("generate commitment hash: %w", err)
-	}
+	commitment := toBeefyClientCommitment(&r.SignedCommitment.Commitment)
 
 	proof, err := r.generateValidatorAddressProof(valAddrIndex)
 	if err != nil {
@@ -63,12 +64,15 @@ func (r *Request) MakeSubmitInitialParams(valAddrIndex int64, initialBitfield []
 		return nil, fmt.Errorf("convert to ethereum address: %w", err)
 	}
 
-	v, _r, s := cleanSignature(validatorSignature)
+	v, _r, s, _, err := CleanSignature(validatorSignature)
+	if err != nil {
+		return nil, fmt.Errorf("clean signature: %w", err)
+	}
 
 	msg := InitialRequestParams{
-		CommitmentHash: *commitmentHash,
-		Bitfield:       initialBitfield,
-		Proof: beefyclient.BeefyClientValidatorProof{
+		Commitment: *commitment,
+		Bitfield:   initialBitfield,
+		Proof: contracts.BeefyClientValidatorProof{
 			V:       v,
 			R:       _r,
 			S:       s,
@@ -81,35 +85,80 @@ func (r *Request) MakeSubmitInitialParams(valAddrIndex int64, initialBitfield []
 	return &msg, nil
 }
 
-func cleanSignature(input types.BeefySignature) (uint8, [32]byte, [32]byte) {
+func toBeefyClientCommitment(c *types.Commitment) *contracts.BeefyClientCommitment {
+	return &contracts.BeefyClientCommitment{
+		BlockNumber:    c.BlockNumber,
+		ValidatorSetID: c.ValidatorSetID,
+		Payload:        toBeefyPayload(c.Payload),
+	}
+}
+
+// Implementation derived from https://github.com/OpenZeppelin/openzeppelin-contracts/blob/5bb3f3e788c6b2c806d562ef083b438354f969d7/contracts/utils/cryptography/ECDSA.sol#L139-L145
+func CleanSignature(input types.BeefySignature) (v uint8, r [32]byte, s [32]byte, reverted bool, err error) {
 	// Update signature format (Polkadot uses recovery IDs 0 or 1, Eth uses 27 or 28, so we need to add 27)
 	// Split signature into r, s, v and add 27 to v
-	r := *(*[32]byte)(input[:32])
-	s := *(*[32]byte)(input[32:64])
-	v := byte(uint8(input[64]) + 27)
-	return v, r, s
+	r = *(*[32]byte)(input[:32])
+	s = *(*[32]byte)(input[32:64])
+	v = uint8(input[64])
+	if v < 27 {
+		v += 27
+	}
+	if v != 27 && v != 28 {
+		return v, r, s, reverted, fmt.Errorf("invalid V:%d", v)
+	}
+	var N *uint256.Int = uint256.NewInt(0)
+	N.SetFromHex("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141")
+	var halfN *uint256.Int = uint256.NewInt(0)
+	halfN.SetFromHex("0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0")
+	var s256 *uint256.Int = uint256.NewInt(0)
+	err = s256.SetFromHex(util.BytesToHexString(s[:]))
+	if err != nil && err != uint256.ErrLeadingZero {
+		return v, r, s, reverted, fmt.Errorf("invalid S:%s,error is:%w", util.BytesToHexString(s[:]), err)
+	}
+	// If polkadot library generates malleable signatures, such as s-values in the upper range, calculate a new s-value
+	// with 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 - s1 and flip v from 27 to 28 or
+	// vice versa.
+	if s256.Gt(halfN) {
+		var negativeS256 *uint256.Int = uint256.NewInt(0)
+		negativeS256 = negativeS256.Sub(N, s256)
+		s = negativeS256.Bytes32()
+		if v%2 == 0 {
+			v = v - 1
+		} else {
+			v = v + 1
+		}
+		reverted = true
+	}
+	return v, r, s, reverted, nil
 }
 
 func (r *Request) generateValidatorAddressProof(validatorIndex int64) ([][32]byte, error) {
-	leaves := make([][]byte, len(r.Validators))
-	for i, rawAddress := range r.Validators {
+	var leaves [][]byte
+	var err error
+	var invalidAddress []string
+	for _, rawAddress := range r.Validators {
 		address, err := rawAddress.IntoEthereumAddress()
 		if err != nil {
-			return nil, fmt.Errorf("convert to ethereum address: %w", err)
+			invalidAddress = append(invalidAddress, util.BytesToHexString(rawAddress[:]))
+			leaves = append(leaves, make([]byte, 0))
+		} else {
+			leaves = append(leaves, address.Bytes())
 		}
-		leaves[i] = address.Bytes()
 	}
-
-	_, _, proof, err := merkle.GenerateMerkleProof(leaves, validatorIndex)
+	_, root, proof, err := merkle.GenerateMerkleProof(leaves, validatorIndex)
 	if err != nil {
 		return nil, err
+	}
+	equal := slices.Equal(r.ValidatorsRoot[:], root)
+	if !equal {
+		return nil, fmt.Errorf("validator root %#x not match calculated root %#x, invalid address are: %s", r.ValidatorsRoot[:], root, invalidAddress)
 	}
 
 	return proof, nil
 }
 
 func (r *Request) MakeSubmitFinalParams(validatorIndices []uint64, initialBitfield []*big.Int) (*FinalRequestParams, error) {
-	validatorProofs := []beefyclient.BeefyClientValidatorProof{}
+	validatorProofs := []contracts.BeefyClientValidatorProof{}
 
 	for _, validatorIndex := range validatorIndices {
 		ok, beefySig := r.SignedCommitment.Signatures[validatorIndex].Unwrap()
@@ -117,7 +166,10 @@ func (r *Request) MakeSubmitFinalParams(validatorIndices []uint64, initialBitfie
 			return nil, fmt.Errorf("signature is empty")
 		}
 
-		v, _r, s := cleanSignature(beefySig)
+		v, _r, s, _, err := CleanSignature(beefySig)
+		if err != nil {
+			return nil, fmt.Errorf("clean signature: %w", err)
+		}
 		account, err := r.Validators[validatorIndex].IntoEthereumAddress()
 		if err != nil {
 			return nil, fmt.Errorf("convert to ethereum address: %w", err)
@@ -128,7 +180,7 @@ func (r *Request) MakeSubmitFinalParams(validatorIndices []uint64, initialBitfie
 			return nil, err
 		}
 
-		validatorProofs = append(validatorProofs, beefyclient.BeefyClientValidatorProof{
+		validatorProofs = append(validatorProofs, contracts.BeefyClientValidatorProof{
 			V:       v,
 			R:       _r,
 			S:       s,
@@ -138,18 +190,18 @@ func (r *Request) MakeSubmitFinalParams(validatorIndices []uint64, initialBitfie
 		})
 	}
 
-	payload, err := buildPayload(r.SignedCommitment.Commitment.Payload)
-	if err != nil {
-		return nil, err
-	}
-
-	commitment := beefyclient.BeefyClientCommitment{
-		Payload:        *payload,
+	commitment := contracts.BeefyClientCommitment{
+		Payload:        toBeefyPayload(r.SignedCommitment.Commitment.Payload),
 		BlockNumber:    r.SignedCommitment.Commitment.BlockNumber,
 		ValidatorSetID: r.SignedCommitment.Commitment.ValidatorSetID,
 	}
 
-	inputLeaf := beefyclient.BeefyClientMMRLeaf{
+	inputLeaf := contracts.BeefyClientMMRLeaf{}
+
+	var merkleProofItems [][32]byte
+
+	proofOrder := new(big.Int)
+	inputLeaf = contracts.BeefyClientMMRLeaf{
 		Version:              uint8(r.Proof.Leaf.Version),
 		ParentNumber:         uint32(r.Proof.Leaf.ParentNumberAndHash.ParentNumber),
 		ParentHash:           r.Proof.Leaf.ParentNumberAndHash.Hash,
@@ -158,11 +210,10 @@ func (r *Request) MakeSubmitFinalParams(validatorIndices []uint64, initialBitfie
 		NextAuthoritySetLen:  uint32(r.Proof.Leaf.BeefyNextAuthoritySet.Len),
 		NextAuthoritySetRoot: r.Proof.Leaf.BeefyNextAuthoritySet.Root,
 	}
-
-	merkleProofItems := [][32]byte{}
 	for _, mmrProofItem := range r.Proof.MerkleProofItems {
 		merkleProofItems = append(merkleProofItems, mmrProofItem)
 	}
+	proofOrder = proofOrder.SetUint64(r.Proof.MerkleProofOrder)
 
 	msg := FinalRequestParams{
 		Commitment:     commitment,
@@ -170,58 +221,61 @@ func (r *Request) MakeSubmitFinalParams(validatorIndices []uint64, initialBitfie
 		Proofs:         validatorProofs,
 		Leaf:           inputLeaf,
 		LeafProof:      merkleProofItems,
-		LeafProofOrder: new(big.Int).SetUint64(r.Proof.MerkleProofOrder),
+		LeafProofOrder: proofOrder,
 	}
 
 	return &msg, nil
 }
 
-// Builds a payload which is partially SCALE-encoded. This is more efficient for the light client to verify
-// as it does not have to implement a fully fledged SCALE-encoder.
-func buildPayload(items []types.PayloadItem) (*beefyclient.BeefyClientPayload, error) {
-	index := -1
-
-	for i, payloadItem := range items {
-		// MMR Root ID as "mh"
-		// https://github.com/paritytech/substrate/blob/cbd8f1b56fd8ab9af0d9317432cc735264c89d70/primitives/beefy/src/payload.rs#L33
-		if payloadItem.ID == [2]byte{0x6d, 0x68} {
-			index = i
+func toBeefyPayload(items []types.PayloadItem) []contracts.BeefyClientPayloadItem {
+	beefyItems := make([]contracts.BeefyClientPayloadItem, len(items))
+	for i, item := range items {
+		beefyItems[i] = contracts.BeefyClientPayloadItem{
+			PayloadID: item.ID,
+			Data:      item.Data,
 		}
 	}
 
-	// Contains one entry so index should be 0
-	// https://github.com/paritytech/substrate/blob/cbd8f1b56fd8ab9af0d9317432cc735264c89d70/primitives/beefy/src/payload.rs#L48
-	if index < 0 {
-		return nil, fmt.Errorf("did not find mmr root hash in commitment")
+	return beefyItems
+}
+
+func commitmentToLog(commitment contracts.BeefyClientCommitment) logrus.Fields {
+	payloadFields := make([]logrus.Fields, len(commitment.Payload))
+	for i, payloadItem := range commitment.Payload {
+		payloadFields[i] = logrus.Fields{
+			"payloadID": string(rune(payloadItem.PayloadID[0])) + string(rune(payloadItem.PayloadID[1])),
+			"data":      "0x" + hex.EncodeToString(payloadItem.Data),
+		}
 	}
 
-	mmrRootHash := [32]byte{}
+	return logrus.Fields{
+		"blockNumber":    commitment.BlockNumber,
+		"validatorSetID": commitment.ValidatorSetID,
+		"payload":        payloadFields,
+	}
+}
 
-	if len(items[index].Data) != 32 {
-		return nil, fmt.Errorf("mmr root hash is invalid")
+func bitfieldToStrings(bitfield []*big.Int) []string {
+	strings := make([]string, len(bitfield))
+	for i, subfield := range bitfield {
+		strings[i] = fmt.Sprintf("%0256b", subfield)
 	}
 
-	if copy(mmrRootHash[:], items[index].Data) != 32 {
-		return nil, fmt.Errorf("mmr root hash is invalid")
+	return strings
+}
+
+func proofToLog(proof contracts.BeefyClientValidatorProof) logrus.Fields {
+	hexProof := make([]string, len(proof.Proof))
+	for i, proof := range proof.Proof {
+		hexProof[i] = Hex(proof[:])
 	}
 
-	payloadBytes, err := types.EncodeToBytes(items)
-	if err != nil {
-		return nil, err
+	return logrus.Fields{
+		"V":       proof.V,
+		"R":       Hex(proof.R[:]),
+		"S":       Hex(proof.S[:]),
+		"Index":   proof.Index.Uint64(),
+		"Account": proof.Account.Hex(),
+		"Proof":   hexProof,
 	}
-
-	// Trick here is that in payload of beefy commitment only MmrRootHash is required
-	// so just split to some unknown prefix and suffix in order to reconstruct later
-	// https://github.com/Snowfork/snowbridge/blob/75a475cbf8fc8e13577ad6b773ac452b2bf82fbb/core/packages/contracts/contracts/BeefyClient.sol#L483-L492
-	slices := bytes.Split(payloadBytes, mmrRootHash[:])
-	if len(slices) != 2 {
-		// Its theoretically possible that the payload items may contain mmrRootHash more than once, causing an invalid split
-		return nil, fmt.Errorf("expected 2 slices")
-	}
-
-	return &beefyclient.BeefyClientPayload{
-		MmrRootHash: mmrRootHash,
-		Prefix:      slices[0],
-		Suffix:      slices[1],
-	}, nil
 }

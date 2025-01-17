@@ -8,8 +8,9 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	gethTrie "github.com/ethereum/go-ethereum/trie"
 	"github.com/snowfork/snowbridge/relayer/chain/ethereum"
-	"github.com/snowfork/snowbridge/relayer/chain/parachain"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/snowfork/snowbridge/relayer/chain/parachain"
 )
 
 type TestProof parachain.ProofData
@@ -59,17 +60,11 @@ func TestMessage_Proof(t *testing.T) {
 	assert.Nil(t, err)
 	assert.NotNil(t, msg)
 
-	msgInner, ok := msg.Args[0].(parachain.Message)
-	if !ok {
-		panic("unexpected type")
-	}
-
-	assert.Equal(t, block.Hash().Hex(), msgInner.Proof.BlockHash.Hex())
-	key, err := rlp.EncodeToBytes(uint(msgInner.Proof.TxIndex))
+	key, err := rlp.EncodeToBytes(uint(5))
 	if err != nil {
 		panic(err)
 	}
-	proofNodes := TestProof(*msgInner.Proof.Data)
+	proofNodes := TestProof(*msg.Proof.ReceiptProof)
 	provenReceipt, err := gethTrie.VerifyProof(block.ReceiptHash(), key, &proofNodes)
 	assert.Nil(t, err)
 	assert.Equal(t, provenReceipt, receipt5Encoded)

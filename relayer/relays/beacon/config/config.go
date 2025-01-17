@@ -2,7 +2,7 @@ package config
 
 import (
 	"errors"
-	"github.com/snowfork/snowbridge/relayer/config"
+	"fmt"
 )
 
 type Config struct {
@@ -11,83 +11,93 @@ type Config struct {
 }
 
 type SpecSettings struct {
+	SyncCommitteeSize            uint64 `mapstructure:"syncCommitteeSize"`
 	SlotsInEpoch                 uint64 `mapstructure:"slotsInEpoch"`
 	EpochsPerSyncCommitteePeriod uint64 `mapstructure:"epochsPerSyncCommitteePeriod"`
-	MaxSlotsPerHistoricalRoot    int    `mapstructure:"maxSlotsPerHistoricalRoot"`
-}
-
-type Spec struct {
-	Minimal SpecSettings `mapstructure:"minimal"`
-	Mainnet SpecSettings `mapstructure:"mainnet"`
+	DenebForkEpoch               uint64 `mapstructure:"denebForkedEpoch"`
 }
 
 type SourceConfig struct {
 	Beacon BeaconConfig `mapstructure:"beacon"`
 }
 
+type DataStore struct {
+	Location   string `mapstructure:"location"`
+	MaxEntries uint64 `mapstructure:"maxEntries"`
+}
+
 type BeaconConfig struct {
-	Endpoint   string `mapstructure:"endpoint"`
-	Spec       Spec   `mapstructure:"spec"`
-	ActiveSpec string `mapstructure:"activeSpec"`
+	Endpoint      string       `mapstructure:"endpoint"`
+	StateEndpoint string       `mapstructure:"stateEndpoint"`
+	Spec          SpecSettings `mapstructure:"spec"`
+	DataStore     DataStore    `mapstructure:"datastore"`
 }
 
 type SinkConfig struct {
-	Parachain config.ParachainConfig `mapstructure:"parachain"`
+	Parachain          ParachainConfig `mapstructure:"parachain"`
+	UpdateSlotInterval uint64          `mapstructure:"updateSlotInterval"`
 }
 
-func (c Config) GetSpecSettings() SpecSettings {
-	if c.Source.Beacon.ActiveSpec == "minimal" {
-		return c.Source.Beacon.Spec.Minimal
+type ParachainConfig struct {
+	Endpoint             string `mapstructure:"endpoint"`
+	MaxWatchedExtrinsics int64  `mapstructure:"maxWatchedExtrinsics"`
+	// The max number of header in the FinalizedBeaconStateBuffer on-chain.
+	// https://github.com/paritytech/polkadot-sdk/blob/master/bridges/snowbridge/pallets/ethereum-client/src/types.rs#L23
+	HeaderRedundancy uint64 `mapstructure:"headerRedundancy"`
+}
+
+func (c Config) Validate() error {
+	err := c.Source.Beacon.Validate()
+	if err != nil {
+		return fmt.Errorf("source beacon config: %w", err)
 	}
-
-	return c.Source.Beacon.Spec.Mainnet
-}
-
-func (c Config) GetSpecSettingsBySpec(spec ActiveSpec) SpecSettings {
-	if spec.IsMinimal() {
-		return c.Source.Beacon.Spec.Minimal
+	err = c.Sink.Parachain.Validate()
+	if err != nil {
+		return fmt.Errorf("sink parachain config: %w", err)
 	}
-
-	return c.Source.Beacon.Spec.Mainnet
-}
-
-type ActiveSpec string
-
-const (
-	Mainnet ActiveSpec = "mainnet"
-	Minimal ActiveSpec = "minimal"
-)
-
-func (c Config) GetActiveSpec() ActiveSpec {
-	switch c.Source.Beacon.ActiveSpec {
-	case string(Mainnet):
-		return Mainnet
-	case string(Minimal):
-		return Minimal
-	default:
-		return Mainnet
+	if c.Sink.UpdateSlotInterval == 0 {
+		return errors.New("parachain [updateSlotInterval] config is not set")
 	}
+	return nil
 }
 
-func (a ActiveSpec) IsMainnet() bool {
-	return a == Mainnet
-}
-
-func (a ActiveSpec) IsMinimal() bool {
-	return a == Minimal
-}
-
-func ToSpec(spec string) (ActiveSpec, error) {
-	switch spec {
-	case string(Mainnet):
-		return Mainnet, nil
-	case string(Minimal):
-		return Minimal, nil
-	default:
-		return Minimal, errors.New("spec is not a valid value")
+func (b BeaconConfig) Validate() error {
+	// spec settings
+	if b.Spec.EpochsPerSyncCommitteePeriod == 0 {
+		return errors.New("source beacon setting [epochsPerSyncCommitteePeriod] is not set")
 	}
+	if b.Spec.SlotsInEpoch == 0 {
+		return errors.New("source beacon setting [slotsInEpoch] is not set")
+	}
+	if b.Spec.SyncCommitteeSize == 0 {
+		return errors.New("source beacon setting [syncCommitteeSize] is not set")
+	}
+	// data store
+	if b.DataStore.Location == "" {
+		return errors.New("source beacon datastore [location] is not set")
+	}
+	if b.DataStore.MaxEntries == 0 {
+		return errors.New("source beacon datastore [maxEntries] is not set")
+	}
+	// api endpoints
+	if b.Endpoint == "" {
+		return errors.New("source beacon setting [endpoint] is not set")
+	}
+	if b.StateEndpoint == "" {
+		return errors.New("source beacon setting [stateEndpoint] is not set")
+	}
+	return nil
 }
 
-func (a ActiveSpec) ToString() string {
-	return string(a)
+func (p ParachainConfig) Validate() error {
+	if p.Endpoint == "" {
+		return errors.New("[endpoint] is not set")
+	}
+	if p.MaxWatchedExtrinsics == 0 {
+		return errors.New("[maxWatchedExtrinsics] is not set")
+	}
+	if p.HeaderRedundancy == 0 {
+		return errors.New("[headerRedundancy] is not set")
+	}
+	return nil
 }

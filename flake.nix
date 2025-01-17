@@ -1,25 +1,25 @@
-{
+ {
     description = "Snowbridge flake";
 
     inputs = {
-        nixpkgs.url = "nixpkgs/nixos-22.11";
-        rust-overlay.url = "github:oxalica/rust-overlay";
+        nixpkgs.url = "nixpkgs/nixos-unstable";
         flake-utils.url  = "github:numtide/flake-utils";
         foundry.url = "github:shazow/foundry.nix/monthly";
     };
 
-    outputs = { self, nixpkgs, rust-overlay, flake-utils, foundry }:
+    outputs = { self, nixpkgs, flake-utils, foundry }:
+
     let
-        supportedSystems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" ];
-        overlays = [ (import rust-overlay) foundry.overlay ];
+        supportedSystems = [ "aarch64-darwin" "aarch64-linux" "x86_64-darwin" "x86_64-linux" ];
+        overlays = [ foundry.overlay ];
     in
+
     flake-utils.lib.eachSystem supportedSystems (system:
         let
             pkgs = import nixpkgs { inherit system overlays; };
             cwd = builtins.toString ./.;
-            rust =
-              pkgs.rust-bin.fromRustupToolchainFile "${cwd}/parachain/rust-toolchain.toml";
         in
+
         with pkgs;
         {
             devShells.default = pkgs.mkShell {
@@ -28,15 +28,20 @@
                     curl
                     direnv
                     git
+                    lsof
                     jq
                     moreutils
                     typos
+                    ripgrep
+                    tree
                     # ps for zombienet, required in pure shells on Linux
                     ps
 
                     # typescript
+                    python311
                     nodePackages.pnpm
-                    nodejs-18_x
+                    nodejs_20
+                    (yarn.override { nodejs = nodejs_20; })
 
                     # ethereum
                     foundry-bin
@@ -46,39 +51,51 @@
 
                     # relayer
                     go
+                    gotools
+                    gopls
+                    go-outline
+                    gopkgs
+                    godef
+                    golint
                     mage
                     revive
+                    delve
 
                     # parachain
                     clang
                     gcc
                     libiconv
                     protobuf
-                    rust
+                    # NOTE: when upgrading rustup, check for a command to install the version in the toolchain file:
+                    # https://github.com/rust-lang/rustup/issues/2686
+                    rustup
 
                     cowsay
                 ];
 
                 shellHook = ''
-                    # set HOME for direnv and go
-                    #
+                    # set HOME for direnv:
                     # direnv needs config, cache & data dirs (DIRENV_CONFIG, XDG_CACHE_HOME & XDG_DATA_HOME
                     # respectively) that can be automatically set when HOME is available
-                    #
-                    # relayer builds fail without GOPATH & GOCACHE set
-                    # explicitly setting HOME allows go to infer these vars
-                    #
                     export HOME=~
+
+                    export GOCACHE=$PWD/gocache
+                    export GOPATH=$PWD/go
+                    export PATH=$GOPATH/bin:$PATH
+
+                    export CARGO_HOME=$PWD/.cargo
+                    export RUSTUP_HOME=$PWD/.rustup
+                    export RUST_NIGHTLY_VERSION=nightly-2024-02-08
+                    export PATH=$CARGO_HOME/bin:$PATH
+                    export LODESTAR_VERSION=v1.19.0
 
                     eval "$(direnv hook bash)"
 
                     # LIBCLANG_PATH points rocksdb to a clang.so on Linux
                     export LIBCLANG_PATH="$(readlink -f ${pkgs.clang}/resource-root/include | xargs dirname | xargs dirname | xargs dirname)"
+                    export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc ]}
 
-                    echo "Initializing Snowbridge Dev Environment..."
-                    (cd core && pnpm install)
-
-                    cowsay "Snowbridge Dev Environment Ready"
+                    cowsay "Development Environment Ready"
                 '';
             };
         }

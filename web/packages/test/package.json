@@ -1,0 +1,15 @@
+{
+  "name": "@snowbridge/test",
+  "version": "1.0.1",
+  "description": "Snowbridge Integration Tests",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Snowfork/snowbridge.git",
+    "directory": "web/packages/test"
+  },
+  "devDependencies": {
+    "@zombienet/cli": "^1.3.118",
+    "@polkadot/api-cli": "0.62.1"
+  }
+}

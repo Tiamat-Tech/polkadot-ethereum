@@ -1,8 +1,12 @@
 package scale
 
 import (
+	"errors"
+	"fmt"
+
 	"github.com/ethereum/go-ethereum/common"
 	ssz "github.com/ferranbt/fastssz"
+	"github.com/snowfork/go-substrate-rpc-client/v4/scale"
 	"github.com/snowfork/go-substrate-rpc-client/v4/types"
 	"github.com/snowfork/snowbridge/relayer/relays/beacon/state"
 )
@@ -13,55 +17,77 @@ type BlockRootProof struct {
 	Tree  *ssz.Node
 }
 
-type InitialSync struct {
+type BeaconCheckpoint struct {
 	Header                     BeaconHeader
 	CurrentSyncCommittee       SyncCommittee
 	CurrentSyncCommitteeBranch []types.H256
 	ValidatorsRoot             types.H256
-	ImportTime                 types.U64
+	BlockRootsRoot             types.H256
+	BlockRootsBranch           []types.H256
 }
 
-type SyncCommitteePeriodUpdate struct {
-	Payload                  SyncCommitteePeriodPayload
+type Update struct {
+	Payload                  UpdatePayload
 	FinalizedHeaderBlockRoot common.Hash
 	BlockRootsTree           *ssz.Node
 }
 
-type SyncCommitteePeriodPayload struct {
+type ProofPayload struct {
+	HeaderPayload    HeaderUpdatePayload
+	FinalizedPayload *Update
+}
+
+type UpdatePayload struct {
 	AttestedHeader          BeaconHeader
-	NextSyncCommittee       SyncCommittee
-	NextSyncCommitteeBranch []types.H256
+	SyncAggregate           SyncAggregate
+	SignatureSlot           types.U64
+	NextSyncCommitteeUpdate OptionNextSyncCommitteeUpdatePayload
 	FinalizedHeader         BeaconHeader
 	FinalityBranch          []types.H256
-	SyncAggregate           SyncAggregate
-	SyncCommitteePeriod     types.U64
-	SignatureSlot           types.U64
-	BlockRootsHash          types.H256
-	BlockRootProof          []types.H256
+	BlockRootsRoot          types.H256
+	BlockRootsBranch        []types.H256
+}
+type OptionNextSyncCommitteeUpdatePayload struct {
+	HasValue bool
+	Value    NextSyncCommitteeUpdatePayload
 }
 
-type FinalizedHeaderPayload struct {
-	AttestedHeader  BeaconHeader
-	FinalizedHeader BeaconHeader
-	FinalityBranch  []types.H256
-	SyncAggregate   SyncAggregate
-	SignatureSlot   types.U64
-	BlockRootsHash  types.H256
-	BlockRootProof  []types.H256
+type NextSyncCommitteeUpdatePayload struct {
+	NextSyncCommittee       SyncCommittee
+	NextSyncCommitteeBranch []types.H256
 }
 
-type FinalizedHeaderUpdate struct {
-	Payload                  FinalizedHeaderPayload
-	FinalizedHeaderBlockRoot common.Hash
-	BlockRootsTree           *ssz.Node
+func (o OptionNextSyncCommitteeUpdatePayload) Encode(encoder scale.Encoder) error {
+	return encoder.EncodeOption(o.HasValue, o.Value)
 }
 
-type HeaderUpdate struct {
-	Block                         BeaconBlock
-	SyncAggregate                 SyncAggregate
-	SignatureSlot                 types.U64
-	BlockRootProof                []types.H256
-	BlockRootProofFinalizedHeader types.H256
+func (o *OptionNextSyncCommitteeUpdatePayload) Decode(decoder scale.Decoder) error {
+	return decoder.DecodeOption(&o.HasValue, &o.Value)
+}
+
+type HeaderUpdatePayload struct {
+	Header          BeaconHeader
+	AncestryProof   OptionAncestryProof
+	ExecutionHeader VersionedExecutionPayloadHeader
+	ExecutionBranch []types.H256
+}
+
+type OptionAncestryProof struct {
+	HasValue bool
+	Value    AncestryProof
+}
+
+type AncestryProof struct {
+	HeaderBranch       []types.H256
+	FinalizedBlockRoot types.H256
+}
+
+func (o OptionAncestryProof) Encode(encoder scale.Encoder) error {
+	return encoder.EncodeOption(o.HasValue, o.Value)
+}
+
+func (o *OptionAncestryProof) Decode(decoder scale.Decoder) error {
+	return decoder.DecodeOption(&o.HasValue, &o.Value)
 }
 
 type BeaconHeader struct {
@@ -130,9 +156,9 @@ type Deposit struct {
 	Data  DepositData
 }
 
-type DepositVoluntaryExit struct {
-	Proof []types.H256
-	Data  DepositData
+type SignedVoluntaryExit struct {
+	Exit      VoluntaryExit
+	Signature []byte
 }
 
 type VoluntaryExit struct {
@@ -140,9 +166,20 @@ type VoluntaryExit struct {
 	ValidaterIndex types.U64
 }
 
-type ExecutionPayload struct {
+type BLSToExecutionChange struct {
+	ValidatorIndex     types.U64
+	FromBlsPubkey      []byte
+	ToExecutionAddress []byte
+}
+
+type SignedBLSToExecutionChange struct {
+	Message   *BLSToExecutionChange
+	Signature []byte
+}
+
+type ExecutionPayloadHeaderCapella struct {
 	ParentHash       types.H256
-	FeeRecipient     []byte
+	FeeRecipient     types.H160
 	StateRoot        types.H256
 	ReceiptsRoot     types.H256
 	LogsBloom        []byte
@@ -155,6 +192,7 @@ type ExecutionPayload struct {
 	BaseFeePerGas    types.U256
 	BlockHash        types.H256
 	TransactionsRoot types.H256
+	WithdrawalsRoot  types.H256
 }
 
 type Body struct {
@@ -165,9 +203,23 @@ type Body struct {
 	AttesterSlashings []AttesterSlashing
 	Attestations      []Attestation
 	Deposits          []Deposit
-	VoluntaryExits    []VoluntaryExit
+	VoluntaryExits    []SignedVoluntaryExit
 	SyncAggregate     SyncAggregate
-	ExecutionPayload  ExecutionPayload
+	ExecutionPayload  ExecutionPayloadHeaderCapella
+}
+
+type BodyCapella struct {
+	RandaoReveal          []byte
+	Eth1Data              Eth1Data
+	Graffiti              types.H256
+	ProposerSlashings     []ProposerSlashing
+	AttesterSlashings     []AttesterSlashing
+	Attestations          []Attestation
+	Deposits              []Deposit
+	VoluntaryExits        []SignedVoluntaryExit
+	SyncAggregate         SyncAggregate
+	ExecutionPayload      ExecutionPayloadHeaderCapella
+	BlsToExecutionChanges []*SignedBLSToExecutionChange
 }
 
 type BeaconBlock struct {
@@ -183,9 +235,49 @@ type SyncCommittee struct {
 	AggregatePubkey [48]byte
 }
 
+// Use a custom SCALE encoder to encode SyncCommitteeBits as fixed array
+func (s SyncCommittee) Encode(encoder scale.Encoder) error {
+
+	switch len(s.Pubkeys) {
+	case 32:
+		var pubkeys [32][48]byte
+		copy(pubkeys[:], s.Pubkeys)
+		encoder.Encode(pubkeys)
+	case 512:
+		var pubkeys [512][48]byte
+		copy(pubkeys[:], s.Pubkeys)
+		encoder.Encode(pubkeys)
+	default:
+		return fmt.Errorf("invalid sync committee size")
+	}
+	encoder.Encode(s.AggregatePubkey)
+	return nil
+}
+
 type SyncAggregate struct {
 	SyncCommitteeBits      []byte
-	SyncCommitteeSignature []byte
+	SyncCommitteeSignature [96]byte
+}
+
+// Use a custom SCALE encoder to encode SyncCommitteeBits as fixed array
+func (s SyncAggregate) Encode(encoder scale.Encoder) error {
+
+	switch len(s.SyncCommitteeBits) {
+	case 4:
+		//	32 / 8 = 4
+		var syncCommitteeBits [4]byte
+		copy(syncCommitteeBits[:], s.SyncCommitteeBits)
+		encoder.Encode(syncCommitteeBits)
+	case 64:
+		//	512 / 8 = 64
+		var syncCommitteeBits [64]byte
+		copy(syncCommitteeBits[:], s.SyncCommitteeBits)
+		encoder.Encode(syncCommitteeBits)
+	default:
+		return fmt.Errorf("invalid sync committee size")
+	}
+	encoder.Encode(s.SyncCommitteeSignature)
+	return nil
 }
 
 func (b *BeaconHeader) ToSSZ() *state.BeaconBlockHeader {
@@ -196,4 +288,44 @@ func (b *BeaconHeader) ToSSZ() *state.BeaconBlockHeader {
 		StateRoot:     common.FromHex(b.StateRoot.Hex()),
 		BodyRoot:      common.FromHex(b.BodyRoot.Hex()),
 	}
+}
+
+type CompactBeaconState struct {
+	Slot           types.UCompact
+	BlockRootsRoot types.H256
+}
+
+type BeaconState struct {
+	CompactBeaconState
+	BlockRoot types.H256
+}
+
+type VersionedExecutionPayloadHeader struct {
+	Capella *ExecutionPayloadHeaderCapella
+	Deneb   *ExecutionPayloadHeaderDeneb
+}
+
+var (
+	ErrEncodeVersionedExecutionPayloadHeader = errors.New("error scale encode VersionedExecutionPayloadHeader")
+)
+
+func (v VersionedExecutionPayloadHeader) Encode(encoder scale.Encoder) error {
+	var err error
+	if v.Capella != nil {
+		encoder.PushByte(0)
+		err = encoder.Encode(v.Capella)
+	} else if v.Deneb != nil {
+		encoder.PushByte(1)
+		err = encoder.Encode(v.Deneb)
+	} else {
+		err = ErrEncodeVersionedExecutionPayloadHeader
+	}
+	return err
+}
+
+type CompactExecutionHeader struct {
+	ParentHash   types.H256
+	BlockNumber  types.UCompact
+	StateRoot    types.H256
+	ReceiptsRoot types.H256
 }

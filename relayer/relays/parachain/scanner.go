@@ -1,12 +1,16 @@
 package parachain
 
 import (
+	"bytes"
 	"context"
-	"encoding/hex"
+	"errors"
 	"fmt"
-	"math/big"
-	"sort"
+	"reflect"
 	"strings"
+
+	"github.com/ethereum/go-ethereum/accounts/abi"
+
+	"github.com/snowfork/go-substrate-rpc-client/v4/scale"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -16,30 +20,29 @@ import (
 	"github.com/snowfork/snowbridge/relayer/chain/ethereum"
 	"github.com/snowfork/snowbridge/relayer/chain/parachain"
 	"github.com/snowfork/snowbridge/relayer/chain/relaychain"
-	"github.com/snowfork/snowbridge/relayer/contracts/basic"
+	"github.com/snowfork/snowbridge/relayer/contracts"
+	"github.com/snowfork/snowbridge/relayer/ofac"
 )
 
 type Scanner struct {
-	config           *SourceConfig
-	ethConn          *ethereum.Connection
-	relayConn        *relaychain.Connection
-	paraConn         *parachain.Connection
-	paraID           uint32
-	tasks            chan<- *Task
-	eventQueryClient QueryClient
-	sourceIDs        [][32]byte
+	config    *SourceConfig
+	ethConn   *ethereum.Connection
+	relayConn *relaychain.Connection
+	paraConn  *parachain.Connection
+	paraID    uint32
+	ofac      *ofac.OFAC
+	tasks     chan<- *Task
 }
 
-// Scans for all parachain message commitments that need to be relayed and can be proven
-// using the MMR root at the specified beefyBlockNumber of the relay chain.
+// Scans for all parachain message commitments for the configured parachain channelID that need to be relayed and can be
+// proven using the MMR root at the specified beefyBlockNumber of the relay chain.
 //
 // The algorithm works roughly like this:
-//  1. Fetch channel nonces on both sides of the bridge and compare them
-//  2. If the nonces on the parachain side are larger that means messages
-//     need to be relayed. If not then exit early.
+//  1. Fetch channel nonce on both sides of the bridge and compare them
+//  2. If the nonce on the parachain side is larger that means messages need to be relayed. If not then exit early.
 //  3. Scan parachain blocks to figure out exactly which commitments need to be relayed.
-//  4. For all the parachain blocks with unsettled commitments, determine the relay chain
-//     block number in which the parachain block was included.
+//  4. For all the parachain blocks with unsettled commitments, determine the relay chain block number in which the
+//     parachain block was included.
 func (s *Scanner) Scan(ctx context.Context, beefyBlockNumber uint64) ([]*Task, error) {
 	// fetch last parachain header that was finalized *before* the BEEFY block
 	beefyBlockMinusOneHash, err := s.relayConn.API().RPC.Chain.GetBlockHash(uint64(beefyBlockNumber - 1))
@@ -69,65 +72,42 @@ func (s *Scanner) Scan(ctx context.Context, beefyBlockNumber uint64) ([]*Task, e
 	return tasks, nil
 }
 
-type SourceNonces struct {
-	sourceID                      [32]byte
-	paraBasicNonce, ethBasicNonce uint64
-}
-
 // findTasks finds all the message commitments which need to be relayed
 func (s *Scanner) findTasks(
 	ctx context.Context,
 	paraBlock uint64,
 	paraHash types.Hash,
 ) ([]*Task, error) {
-	basicContract, err := basic.NewBasicInboundChannel(common.HexToAddress(
-		s.config.Contracts.BasicInboundChannel),
-		s.ethConn.Client(),
-	)
+	// Fetch latest nonce in ethereum gateway
+	ethInboundNonce, err := s.findLatestNonce(ctx)
+	log.WithFields(log.Fields{
+		"nonce":     ethInboundNonce,
+		"channelID": s.config.ChannelID,
+	}).Info("Checked latest nonce delivered to ethereum gateway")
+
+	// Fetch latest nonce in parachain outbound queue
+	paraNonceKey, err := types.CreateStorageKey(s.paraConn.Metadata(), "EthereumOutboundQueue", "Nonce", s.config.ChannelID[:], nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create storage key for parachain outbound queue nonce with channelID '%v': %w", s.config.ChannelID, err)
 	}
-
-	options := bind.CallOpts{
-		Pending: true,
-		Context: ctx,
+	var paraNonce types.U64
+	ok, err := s.paraConn.API().RPC.State.GetStorage(paraNonceKey, &paraNonce, paraHash)
+	if err != nil {
+		return nil, fmt.Errorf("fetch nonce from parachain outbound queue with key '%v' and hash '%v': %w", paraNonceKey, paraHash, err)
 	}
-
-	basicChannelSourceNoncesToFind := make(map[types.AccountID]uint64, len(s.sourceIDs))
-	for _, sourceID := range s.sourceIDs {
-		ethBasicNonce, err := basicContract.Nonce(&options, sourceID)
-		if err != nil {
-			return nil, err
-		}
+	if !ok {
 		log.WithFields(log.Fields{
-			"nonce":    ethBasicNonce,
-			"sourceID": types.HexEncodeToString(sourceID[:]),
-		}).Info("Checked latest nonce delivered to ethereum basic channel")
-
-		paraBasicNonceKey, err := types.CreateStorageKey(s.paraConn.Metadata(), "BasicOutboundChannel", "Nonce", sourceID[:], nil)
-		if err != nil {
-			return nil, fmt.Errorf("create storage key for sourceID '%v': %w", types.HexEncodeToString(sourceID[:]), err)
-		}
-		var paraBasicNonce types.U64
-		ok, err := s.paraConn.API().RPC.State.GetStorage(paraBasicNonceKey, &paraBasicNonce, paraHash)
-		if err != nil {
-			log.Error(err)
-			return nil, err
-		}
-		if !ok {
-			paraBasicNonce = 0
-		}
-		log.WithFields(log.Fields{
-			"nonce":    uint64(paraBasicNonce),
-			"sourceID": types.HexEncodeToString(sourceID[:]),
-		}).Info("Checked latest nonce generated by parachain basic channel")
-
-		if uint64(paraBasicNonce) > ethBasicNonce {
-			basicChannelSourceNoncesToFind[sourceID] = ethBasicNonce + 1
-		}
+			"nonceKey":  paraNonceKey,
+			"blockHash": paraHash,
+		}).Info("Fetched empty nonce from parachain outbound queue")
+		paraNonce = 0
 	}
+	log.WithFields(log.Fields{
+		"nonce":     uint64(paraNonce),
+		"channelID": s.config.ChannelID,
+	}).Info("Checked latest nonce generated by parachain outbound queue")
 
-	if len(basicChannelSourceNoncesToFind) == 0 {
+	if !(uint64(paraNonce) > ethInboundNonce) {
 		return nil, nil
 	}
 
@@ -136,128 +116,130 @@ func (s *Scanner) findTasks(
 	tasks, err := s.findTasksImpl(
 		ctx,
 		paraBlock,
-		basicChannelSourceNoncesToFind,
+		types.H256(s.config.ChannelID),
+		ethInboundNonce+1,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	s.gatherProofInputs(tasks)
+	err = s.gatherProofInputs(tasks)
+	if err != nil {
+		return nil, fmt.Errorf("gather proof input: %w", err)
+	}
 
 	return tasks, nil
 }
 
-// Searches for all lost commitments on the basic channel from the given parachain block number backwards
-// until it finds the given nonces
+// Searches from the given parachain block number backwards on the given channel (landID) for all outstanding
+// commitments until it finds the given startingNonce
 func (s *Scanner) findTasksImpl(
-	ctx context.Context,
+	_ context.Context,
 	lastParaBlockNumber uint64,
-	basicChannelSourceNonces map[types.AccountID]uint64,
+	channelID types.H256,
+	startingNonce uint64,
 ) ([]*Task, error) {
-	basicChannelSourceNonceString := "map["
-	for sourceID, nonce := range basicChannelSourceNonces {
-		basicChannelSourceNonceString += fmt.Sprintf("%v: %v ", hex.EncodeToString(sourceID[:]), nonce)
-	}
-	basicChannelSourceNonceString = strings.Trim(basicChannelSourceNonceString, " ")
-	basicChannelSourceNonceString += "]"
-
 	log.WithFields(log.Fields{
-		"basicSourceNonces": basicChannelSourceNonceString,
-		"latestblockNumber": lastParaBlockNumber,
-	}).Debug("Searching backwards from latest block on parachain to find block with nonces")
+		"channelID":         channelID,
+		"nonce":             startingNonce,
+		"latestBlockNumber": lastParaBlockNumber,
+	}).Debug("Searching backwards from latest block on parachain to find block with nonce")
 
-	currentBlockNumber := lastParaBlockNumber
-
-	basicChannelScanSources := make(map[types.AccountID]bool, len(basicChannelSourceNonces))
-	for sourceID := range basicChannelSourceNonces {
-		basicChannelScanSources[sourceID] = true
+	messagesKey, err := types.CreateStorageKey(s.paraConn.Metadata(), "EthereumOutboundQueue", "Messages", nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create storage key: %w", err)
 	}
-	scanBasicChannelDone := len(basicChannelScanSources) == 0
 
+	scanOutboundQueueDone := false
 	var tasks []*Task
 
-	for !scanBasicChannelDone && currentBlockNumber > 0 {
+	for currentBlockNumber := lastParaBlockNumber; currentBlockNumber > 0; currentBlockNumber-- {
+		if scanOutboundQueueDone {
+			break
+		}
+
 		log.WithFields(log.Fields{
 			"blockNumber": currentBlockNumber,
 		}).Debug("Checking header")
 
 		blockHash, err := s.paraConn.API().RPC.Chain.GetBlockHash(currentBlockNumber)
 		if err != nil {
-			return nil, fmt.Errorf("fetch blockhash for block %v: %w", currentBlockNumber, err)
+			return nil, fmt.Errorf("fetch block hash for block %v: %w", currentBlockNumber, err)
 		}
 
 		header, err := s.paraConn.API().RPC.Chain.GetHeader(blockHash)
 		if err != nil {
-			return nil, fmt.Errorf("fetch header for %v: %w", blockHash.Hex(), err)
+			return nil, fmt.Errorf("fetch header for block hash %v: %w", blockHash.Hex(), err)
 		}
 
-		digestItems, err := ExtractAuxiliaryDigestItems(header.Digest)
+		commitmentHash, err := ExtractCommitmentFromDigest(header.Digest)
+		if err != nil {
+			return nil, err
+		}
+		if commitmentHash == nil {
+			continue
+		}
+
+		var messages []OutboundQueueMessage
+		raw, err := s.paraConn.API().RPC.State.GetStorageRaw(messagesKey, blockHash)
+		if err != nil {
+			return nil, fmt.Errorf("fetch committed messages for block %v: %w", blockHash.Hex(), err)
+		}
+		decoder := scale.NewDecoder(bytes.NewReader(*raw))
+		n, err := decoder.DecodeUintCompact()
+		if err != nil {
+			return nil, fmt.Errorf("decode message length error: %w", err)
+		}
+		for i := uint64(0); i < n.Uint64(); i++ {
+			m := OutboundQueueMessage{}
+			err = decoder.Decode(&m)
+			if err != nil {
+				return nil, fmt.Errorf("decode message error: %w", err)
+			}
+			isBanned, err := s.IsBanned(m)
+			if err != nil {
+				log.WithError(err).Fatal("error checking banned address found")
+				return nil, fmt.Errorf("banned check: %w", err)
+			}
+			if isBanned {
+				log.Fatal("banned address found")
+				return nil, errors.New("banned address found")
+			}
+			messages = append(messages, m)
+		}
+
+		// For the outbound channel, the commitment hash is the merkle root of the messages
+		// https://github.com/Snowfork/snowbridge/blob/75a475cbf8fc8e13577ad6b773ac452b2bf82fbb/parachain/pallets/basic-channel/src/outbound/mod.rs#L275-L277
+		// To verify it we fetch the message proof from the parachain
+		result, err := scanForOutboundQueueProofs(
+			s.paraConn.API(),
+			blockHash,
+			*commitmentHash,
+			startingNonce,
+			channelID,
+			messages,
+		)
 		if err != nil {
 			return nil, err
 		}
 
-		if len(digestItems) == 0 {
-			currentBlockNumber--
-			continue
-		}
+		scanOutboundQueueDone = result.scanDone
 
-		basicChannelProofs := make([]MessageProof, 0, len(basicChannelSourceNonces))
-
-		events, err := s.eventQueryClient.QueryEvent(ctx, s.config.Parachain.Endpoint, blockHash)
-		if err != nil {
-			return nil, fmt.Errorf("query events: %w", err)
-		}
-
-		for _, digestItem := range digestItems {
-			if !digestItem.IsCommitment {
-				continue
-			}
-
-			if !scanBasicChannelDone {
-				if events == nil {
-					return nil, fmt.Errorf("event basicOutboundChannel.Committed not found in block")
-				}
-
-				digestItemHash := digestItem.AsCommitment.Hash
-				if events.Hash != digestItemHash {
-					return nil, fmt.Errorf("basic channel commitment hash in digest item does not match the one in the Committed event")
-				}
-
-				// For basic channel commit hash is the merkle root calculated from messages
-				// https://github.com/Snowfork/snowbridge/blob/75a475cbf8fc8e13577ad6b773ac452b2bf82fbb/parachain/pallets/basic-channel/src/outbound/mod.rs#L275-L277
-				// to verify it we fetch message proof from parachain
-				result, err := scanForBasicChannelProofs(
-					s.paraConn.API(),
-					digestItemHash,
-					basicChannelSourceNonces,
-					basicChannelScanSources,
-					events.Messages,
-				)
-				if err != nil {
-					return nil, err
-				}
-				basicChannelProofs = result.proofs
-				scanBasicChannelDone = result.scanDone
-			}
-		}
-
-		if len(basicChannelProofs) > 0 {
+		if len(result.proofs) > 0 {
 			task := Task{
-				Header:             header,
-				BasicChannelProofs: &basicChannelProofs,
-				ProofInput:         nil,
-				ProofOutput:        nil,
+				Header:        header,
+				MessageProofs: &result.proofs,
+				ProofInput:    nil,
+				ProofOutput:   nil,
 			}
 			tasks = append(tasks, &task)
 		}
-
-		currentBlockNumber--
 	}
 
-	// sort tasks by ascending block number
-	sort.SliceStable(tasks, func(i, j int) bool {
-		return tasks[i].Header.Number < tasks[j].Header.Number
-	})
+	// Reverse tasks, effectively sorting by ascending block number
+	for i, j := 0, len(tasks)-1; i < j; i, j = i+1, j-1 {
+		tasks[i], tasks[j] = tasks[j], tasks[i]
+	}
 
 	return tasks, nil
 }
@@ -290,7 +272,7 @@ func (s *Scanner) gatherProofInputs(
 			return fmt.Errorf("fetch relaychain block hash: %w", err)
 		}
 
-		parachainHeads, err := s.relayConn.FetchParachainHeads(relayBlockHash)
+		parachainHeads, err := s.relayConn.FetchParasHeads(relayBlockHash)
 		if err != nil {
 			return fmt.Errorf("fetch parachain heads: %w", err)
 		}
@@ -298,6 +280,7 @@ func (s *Scanner) gatherProofInputs(
 		task.ProofInput = &ProofInput{
 			ParaID:           s.paraID,
 			RelayBlockNumber: relayBlockNumber,
+			RelayBlockHash:   relayBlockHash,
 			ParaHeads:        parachainHeads,
 		}
 	}
@@ -356,107 +339,307 @@ func (s *Scanner) findInclusionBlockNumber(
 	return 0, fmt.Errorf("scan terminated")
 }
 
-func scanForBasicChannelProofs(
+func scanForOutboundQueueProofs(
 	api *gsrpc.SubstrateAPI,
-	digestItemHash types.H256,
-	basicChannelSourceNonces map[types.AccountID]uint64,
-	basicChannelScanSources map[types.AccountID]bool,
-	messages []BasicOutboundChannelMessage,
+	blockHash types.Hash,
+	commitmentHash types.H256,
+	startingNonce uint64,
+	channelID types.H256,
+	messages []OutboundQueueMessage,
 ) (*struct {
 	proofs   []MessageProof
 	scanDone bool
 }, error) {
-	var scanBasicChannelDone bool
-	basicChannelProofs := make([]MessageProof, 0, len(basicChannelSourceNonces))
+	var scanDone bool
+	proofs := []MessageProof{}
 
-	for messageIndex, message := range messages {
-		_, shouldCheckSource := basicChannelScanSources[message.SourceID]
-		if !shouldCheckSource {
+	// There are 4 cases here:
+	// 1. There are no messages to relay, continue
+	// 2. All messages have been relayed, halt
+	// 3. There are messages to relay and *none* have been sent, continue
+	// 4. There are messages to relay and *some* have been sent, continue
+
+	// Messages are sorted by nonce ascending. Traverse them backwards to get nonce descending.
+	// This allows us to distinguish between cases 2 & 4 above:
+	// - When nonce is ascending, we find a message where messageNonce < startingNonce but later messages may have a
+	// higher nonce.
+	// - When nonce is descending, we either find the first message has messageNonce < startingNonce (all messages have
+	// been relayed) or we reach messageNonce == startingNonce, potentially in an earlier block.
+	//
+	// eg. m1 has nonce 1 and has been relayed. We're looking for messages from nonce 2 upwards in [m1, m2, m3] (m2 and
+	// m3). With nonce ascending, m1.nonce < 2 but we can't assume case 2 yet (where all messages have been relayed).
+	// With nonce descending, we find m3, then m2 where m2.nonce == 2.
+
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
+
+		if message.ChannelID != channelID {
 			continue
 		}
 
-		nonceToFind := basicChannelSourceNonces[message.SourceID]
-		messageNonceBigInt := big.Int(message.Nonce)
-		messageNonce := messageNonceBigInt.Uint64()
+		messageNonce := message.Nonce
 
-		// This case will be hit if basicNonceToFind has not been committed yet.
-		// Channels emit commitments every N blocks.
-		if messageNonce < nonceToFind {
+		// This case will be hit when there are no new messages to relay.
+		if messageNonce < startingNonce {
 			log.Debugf(
-				"Halting scan for source id '%v'. Messages not committed yet on basic channel",
-				types.HexEncodeToString(message.SourceID[:]),
+				"Halting scan for channelID '%v'. Messages not committed yet on outbound channel",
+				message.ChannelID.Hex(),
 			)
-			scanBasicChannelDone = markSourceScanDone(basicChannelScanSources, message.SourceID)
-			continue
+			scanDone = true
+			break
 		}
 
-		basicChannelMessageProof, err := fetchMessageProof(api, digestItemHash, messageIndex, message)
+		messageProof, err := fetchMessageProof(api, blockHash, uint64(i), message)
 		if err != nil {
 			return nil, err
 		}
-		// check merkle root calculated from message proof is same as the digest hash from header
-		if basicChannelMessageProof.Proof.Root != digestItemHash {
-			log.Warnf(
-				"Halting scan for source id '%v'. Basic channel proof root doesn't match digest item's commitment hash",
-				types.HexEncodeToString(message.SourceID[:]),
+		// Check that the merkle root in the proof is the same as the digest hash from the header
+		if messageProof.Proof.Root != commitmentHash {
+			return nil, fmt.Errorf(
+				"Halting scan for channelID '%v'. Outbound queue proof root '%v' doesn't match digest item's commitment hash '%v'",
+				message.ChannelID.Hex(),
+				messageProof.Proof.Root,
+				commitmentHash,
 			)
-			scanBasicChannelDone = markSourceScanDone(basicChannelScanSources, message.SourceID)
-			continue
 		}
 
-		if messageNonce > nonceToFind {
-			// Collect these commitments
-			basicChannelProofs = append(basicChannelProofs, basicChannelMessageProof)
-		} else if messageNonce == nonceToFind {
-			// Collect this commitment and terminate scan
-			basicChannelProofs = append(basicChannelProofs, basicChannelMessageProof)
-			scanBasicChannelDone = markSourceScanDone(basicChannelScanSources, message.SourceID)
+		// Collect these commitments
+		proofs = append(proofs, messageProof)
+
+		if messageNonce == startingNonce {
+			// Terminate scan
+			scanDone = true
 		}
+	}
+
+	// Reverse proofs, effectively sorting by nonce ascending
+	for i, j := 0, len(proofs)-1; i < j; i, j = i+1, j-1 {
+		proofs[i], proofs[j] = proofs[j], proofs[i]
 	}
 
 	return &struct {
 		proofs   []MessageProof
 		scanDone bool
 	}{
-		proofs:   basicChannelProofs,
-		scanDone: scanBasicChannelDone,
+		proofs:   proofs,
+		scanDone: scanDone,
 	}, nil
-}
-
-func markSourceScanDone(scanBasicChannelSources map[types.AccountID]bool, sourceID types.AccountID) bool {
-	delete(scanBasicChannelSources, sourceID)
-	return len(scanBasicChannelSources) == 0
 }
 
 func fetchMessageProof(
 	api *gsrpc.SubstrateAPI,
-	commitmentHash types.H256,
-	messageIndex int,
-	message BasicOutboundChannelMessage,
+	blockHash types.Hash,
+	messageIndex uint64,
+	message OutboundQueueMessage,
 ) (MessageProof, error) {
 	var proofHex string
-	var rawProof RawMerkleProof
-	var messageProof MessageProof
 
-	commitmentHashHex, err := types.EncodeToHexString(commitmentHash)
+	params, err := types.EncodeToHexString(messageIndex)
 	if err != nil {
-		return messageProof, fmt.Errorf("encode commitmentHash(%v): %w", commitmentHash, err)
+		return MessageProof{}, fmt.Errorf("encode params: %w", err)
 	}
 
-	err = api.Client.Call(&proofHex, "basicOutboundChannel_getMerkleProof", commitmentHashHex, messageIndex)
+	err = api.Client.Call(&proofHex, "state_call", "OutboundQueueApi_prove_message", params, blockHash.Hex())
 	if err != nil {
-		return messageProof, fmt.Errorf("call rpc basicOutboundChannel_getMerkleProof(%v, %v): %w", commitmentHash, messageIndex, err)
+		return MessageProof{}, fmt.Errorf("call RPC OutboundQueueApi_prove_message(%v, %v): %w", messageIndex, blockHash, err)
 	}
 
-	err = types.DecodeFromHexString(proofHex, &rawProof)
+	var optionRawMerkleProof OptionRawMerkleProof
+	err = types.DecodeFromHexString(proofHex, &optionRawMerkleProof)
 	if err != nil {
-		return messageProof, fmt.Errorf("decode merkle proof: %w", err)
+		return MessageProof{}, fmt.Errorf("decode merkle proof: %w", err)
 	}
 
-	proof, err := NewMerkleProof(rawProof)
+	if !optionRawMerkleProof.HasValue {
+		return MessageProof{}, fmt.Errorf("retrieve proof failed")
+	}
+
+	proof, err := NewMerkleProof(optionRawMerkleProof.Value)
 	if err != nil {
-		return messageProof, fmt.Errorf("decode merkle proof: %w", err)
+		return MessageProof{}, fmt.Errorf("decode merkle proof: %w", err)
 	}
 
 	return MessageProof{Message: message, Proof: proof}, nil
+}
+
+func (s *Scanner) findLatestNonce(ctx context.Context) (uint64, error) {
+	// Fetch latest nonce in ethereum gateway
+	gatewayAddress := common.HexToAddress(s.config.Contracts.Gateway)
+	gatewayContract, err := contracts.NewGateway(
+		gatewayAddress,
+		s.ethConn.Client(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("create gateway contract for address '%v': %w", gatewayAddress, err)
+	}
+
+	options := bind.CallOpts{
+		Pending: true,
+		Context: ctx,
+	}
+	ethInboundNonce, _, err := gatewayContract.ChannelNoncesOf(&options, s.config.ChannelID)
+	if err != nil {
+		return 0, fmt.Errorf("fetch nonce from gateway contract for channelID '%v': %w", s.config.ChannelID, err)
+	}
+	return ethInboundNonce, err
+}
+
+func (s *Scanner) IsBanned(m OutboundQueueMessage) (bool, error) {
+	destination, err := GetDestination(m)
+	if err != nil {
+		return true, err
+	}
+
+	return s.ofac.IsBanned("", destination) // TODO the source will be fetched from Subscan in a follow-up PR
+}
+
+func GetDestination(message OutboundQueueMessage) (string, error) {
+	log.WithFields(log.Fields{
+		"command": message.Command,
+		"params":  common.Bytes2Hex(message.Params),
+	}).Debug("Checking message for OFAC")
+
+	address := ""
+
+	bytes32Ty, err := abi.NewType("bytes32", "", nil)
+	if err != nil {
+		return "", err
+	}
+	addressTy, err := abi.NewType("address", "", nil)
+	if err != nil {
+		return "", err
+	}
+	uint256Ty, err := abi.NewType("uint256", "", nil)
+
+	switch message.Command {
+	case 0:
+		log.Debug("Found AgentExecute message")
+
+		uintTy, err := abi.NewType("uint256", "", nil)
+		if err != nil {
+			return "", err
+		}
+		bytesTy, err := abi.NewType("bytes", "", nil)
+		if err != nil {
+			return "", err
+		}
+		tupleTy, err := abi.NewType("tuple", "", []abi.ArgumentMarshaling{
+			{Name: "AgentId", Type: "bytes32"},
+			{Name: "Command", Type: "bytes"},
+		})
+		if err != nil {
+			return "", err
+		}
+
+		tupleArgument := abi.Arguments{
+			{Type: tupleTy},
+		}
+		commandArgument := abi.Arguments{
+			{Type: uintTy},
+			{Type: bytesTy},
+		}
+		transferTokenArgument := abi.Arguments{
+			{Type: addressTy},
+			{Type: addressTy},
+			{Type: uintTy},
+		}
+
+		// Decode the ABI-encoded byte payload
+		decodedTuple, err := tupleArgument.Unpack(message.Params)
+		if err != nil {
+			return "", fmt.Errorf("unpack tuple: %w", err)
+		}
+		if len(decodedTuple) < 1 {
+			return "", fmt.Errorf("decoded tuple not found")
+		}
+
+		tuple := reflect.ValueOf(decodedTuple[0])
+		commandBytes := tuple.FieldByName("Command").Bytes()
+
+		decodedCommand, err := commandArgument.Unpack(commandBytes)
+		if err != nil {
+			return "", fmt.Errorf("unpack command: %w", err)
+		}
+		if len(decodedCommand) < 2 {
+			return "", errors.New("decoded command not found")
+		}
+
+		decodedTransferToken, err := transferTokenArgument.Unpack(decodedCommand[1].([]byte))
+		if err != nil {
+			return "", err
+		}
+		if len(decodedTransferToken) < 3 {
+			return "", errors.New("decode transfer token command")
+		}
+
+		addressValue := decodedTransferToken[1].(common.Address)
+		address = addressValue.String()
+	case 6:
+		log.Debug("Found TransferNativeFromAgent message")
+
+		if err != nil {
+			return "", err
+		}
+		arguments := abi.Arguments{
+			{Type: bytes32Ty},
+			{Type: addressTy},
+			{Type: uint256Ty},
+		}
+
+		decodedMessage, err := arguments.Unpack(message.Params)
+		if err != nil {
+			return "", fmt.Errorf("unpack tuple: %w", err)
+		}
+		if len(decodedMessage) < 3 {
+			return "", fmt.Errorf("decoded message not found")
+		}
+
+		addressValue := decodedMessage[1].(common.Address)
+		address = addressValue.String()
+	case 9:
+		log.Debug("Found TransferNativeToken message")
+
+		arguments := abi.Arguments{
+			{Type: bytes32Ty},
+			{Type: addressTy},
+			{Type: addressTy},
+			{Type: uint256Ty},
+		}
+
+		decodedMessage, err := arguments.Unpack(message.Params)
+		if err != nil {
+			return "", fmt.Errorf("unpack tuple: %w", err)
+		}
+		if len(decodedMessage) < 4 {
+			return "", fmt.Errorf("decoded message not found")
+		}
+
+		addressValue := decodedMessage[2].(common.Address)
+		address = addressValue.String()
+	case 11:
+		log.Debug("Found MintForeignToken message")
+
+		arguments := abi.Arguments{
+			{Type: bytes32Ty},
+			{Type: addressTy},
+			{Type: uint256Ty},
+		}
+
+		decodedMessage, err := arguments.Unpack(message.Params)
+		if err != nil {
+			return "", fmt.Errorf("unpack tuple: %w", err)
+		}
+		if len(decodedMessage) < 3 {
+			return "", fmt.Errorf("decoded message not found")
+		}
+
+		addressValue := decodedMessage[1].(common.Address)
+		address = addressValue.String()
+	}
+
+	destination := strings.ToLower(address)
+
+	log.WithField("destination", destination).Debug("extracted destination from message")
+
+	return destination, nil
 }

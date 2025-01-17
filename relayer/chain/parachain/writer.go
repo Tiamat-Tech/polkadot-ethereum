@@ -5,12 +5,28 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/snowfork/go-substrate-rpc-client/v4/rpc/author"
 	"github.com/snowfork/go-substrate-rpc-client/v4/types"
+	"github.com/snowfork/snowbridge/relayer/relays/beacon/header/syncer/scale"
 	"github.com/snowfork/snowbridge/relayer/relays/beacon/state"
+
+	"github.com/ethereum/go-ethereum/common"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
+
+type ChainWriter interface {
+	BatchCall(ctx context.Context, extrinsic []string, calls []interface{}) error
+	WriteToParachainAndRateLimit(ctx context.Context, extrinsicName string, payload ...interface{}) error
+	WriteToParachainAndWatch(ctx context.Context, extrinsicName string, payload ...interface{}) error
+	GetLastFinalizedHeaderState() (state.FinalizedHeader, error)
+	GetFinalizedStateByStorageKey(key string) (scale.BeaconState, error)
+	GetLastBasicChannelBlockNumber() (uint64, error)
+	GetLastBasicChannelNonceByAddress(address common.Address) (uint64, error)
+	GetFinalizedHeaderStateByBlockRoot(blockRoot types.H256) (state.FinalizedHeader, error)
+	GetLastFinalizedStateIndex() (types.U32, error)
+	GetFinalizedBeaconRootByIndex(index uint32) (types.H256, error)
+}
 
 type ParachainWriter struct {
 	conn                 *Connection
@@ -47,6 +63,31 @@ func (wr *ParachainWriter) Start(ctx context.Context, eg *errgroup.Group) error 
 
 	wr.pool = NewExtrinsicPool(eg, wr.conn, wr.maxWatchedExtrinsics)
 
+	return nil
+}
+
+func (wr *ParachainWriter) BatchCall(ctx context.Context, extrinsic []string, calls []interface{}) error {
+	batchSize := int(wr.maxWatchedExtrinsics)
+	var j int
+	for i := 0; i < len(calls); i += batchSize {
+		j += batchSize
+		if j > len(calls) {
+			j = len(calls)
+		}
+		slicedCalls := append([]interface{}{}, calls[i:j]...)
+		encodedCalls := make([]types.Call, len(slicedCalls))
+		for k := range slicedCalls {
+			call, err := wr.prepCall(extrinsic[k], slicedCalls[k])
+			if err != nil {
+				return err
+			}
+			encodedCalls[k] = *call
+		}
+		err := wr.WriteToParachainAndWatch(ctx, "Utility.batch_all", encodedCalls)
+		if err != nil {
+			return fmt.Errorf("batch call failed: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -90,7 +131,9 @@ func (wr *ParachainWriter) WriteToParachainAndWatch(ctx context.Context, extrins
 			if status.IsDropped || status.IsInvalid || status.IsUsurped || status.IsFinalityTimeout {
 				return fmt.Errorf("parachain write status was dropped, invalid, usurped or finality timed out")
 			}
-			if status.IsInBlock || status.IsFinalized {
+			if status.IsFinalized {
+				log.WithFields(log.Fields{
+					"extrinsic": extrinsicName, "block": status.AsFinalized}).Debug("extrinsic finalized")
 				return nil
 			}
 		case err = <-sub.Err():
@@ -99,6 +142,105 @@ func (wr *ParachainWriter) WriteToParachainAndWatch(ctx context.Context, extrins
 			return nil
 		}
 	}
+}
+
+func (wr *ParachainWriter) GetLastBasicChannelBlockNumber() (uint64, error) {
+	return wr.getNumberFromParachain("EthereumInboundQueue", "LatestVerifiedBlockNumber")
+}
+
+func (wr *ParachainWriter) GetLastBasicChannelNonceByAddresses(addresses []common.Address) (map[common.Address]uint64, error) {
+	addressNonceMap := make(map[common.Address]uint64, len(addresses))
+
+	for _, address := range addresses {
+		nonce, err := wr.GetLastBasicChannelNonceByAddress(address)
+		if err != nil {
+			return addressNonceMap, fmt.Errorf("fetch basic channel nonce for address %s: %w", address, err)
+		}
+
+		addressNonceMap[address] = uint64(nonce)
+	}
+
+	return addressNonceMap, nil
+}
+
+func (wr *ParachainWriter) GetLastBasicChannelNonceByAddress(address common.Address) (uint64, error) {
+	key, err := types.CreateStorageKey(wr.conn.Metadata(), "EthereumInboundQueue", "Nonce", address[:], nil)
+	if err != nil {
+		return 0, fmt.Errorf("create storage key for basic channel nonces: %w", err)
+	}
+
+	var nonce types.U64
+	_, err = wr.conn.API().RPC.State.GetStorageLatest(key, &nonce)
+	if err != nil {
+		return 0, fmt.Errorf("get storage for latest basic channel nonces (err): %w", err)
+	}
+
+	return uint64(nonce), nil
+}
+
+func (wr *ParachainWriter) GetLastFinalizedHeaderState() (state.FinalizedHeader, error) {
+	finalizedState, err := wr.GetFinalizedStateByStorageKey("LatestFinalizedBlockRoot")
+	if err != nil {
+		return state.FinalizedHeader{}, fmt.Errorf("fetch FinalizedBeaconState: %w", err)
+	}
+	initialCheckpointState, err := wr.GetFinalizedStateByStorageKey("InitialCheckpointRoot")
+	if err != nil {
+		return state.FinalizedHeader{}, fmt.Errorf("fetch InitialBeaconState: %w", err)
+	}
+
+	return state.FinalizedHeader{
+		BeaconSlot:            uint64(finalizedState.Slot.Int64()),
+		BeaconBlockRoot:       common.Hash(finalizedState.BlockRoot),
+		InitialCheckpointSlot: uint64(initialCheckpointState.Slot.Int64()),
+		InitialCheckpointRoot: common.Hash(initialCheckpointState.BlockRoot),
+	}, nil
+}
+
+func (wr *ParachainWriter) GetFinalizedStateByStorageKey(key string) (scale.BeaconState, error) {
+	storageRootKey, err := types.CreateStorageKey(wr.conn.Metadata(), "EthereumBeaconClient", key, nil, nil)
+	if err != nil {
+		return scale.BeaconState{}, fmt.Errorf("create storage key: %w", err)
+	}
+
+	var storageRoot types.H256
+	_, err = wr.conn.API().RPC.State.GetStorageLatest(storageRootKey, &storageRoot)
+	if err != nil {
+		return scale.BeaconState{}, fmt.Errorf("fetch storage root: %w", err)
+	}
+
+	storageStateKey, err := types.CreateStorageKey(wr.conn.Metadata(), "EthereumBeaconClient", "FinalizedBeaconState", storageRoot[:], nil)
+	if err != nil {
+		return scale.BeaconState{}, fmt.Errorf("create storage key for FinalizedBeaconState: %w", err)
+	}
+	var compactBeaconState scale.CompactBeaconState
+	_, err = wr.conn.API().RPC.State.GetStorageLatest(storageStateKey, &compactBeaconState)
+	if err != nil {
+		return scale.BeaconState{}, fmt.Errorf("fetch FinalizedBeaconState: %w", err)
+	}
+	return scale.BeaconState{BlockRoot: storageRoot, CompactBeaconState: scale.CompactBeaconState{
+		Slot:           compactBeaconState.Slot,
+		BlockRootsRoot: compactBeaconState.BlockRootsRoot,
+	}}, nil
+}
+
+func (wr *ParachainWriter) GetFinalizedHeaderStateByBlockRoot(blockRoot types.H256) (state.FinalizedHeader, error) {
+	finalizedBeaconStateKey, err := types.CreateStorageKey(wr.conn.Metadata(), "EthereumBeaconClient", "FinalizedBeaconState", blockRoot[:], nil)
+	if err != nil {
+		return state.FinalizedHeader{}, fmt.Errorf("create storage key for FinalizedBeaconState: %w", err)
+	}
+	var compactBeaconState scale.CompactBeaconState
+	_, err = wr.conn.API().RPC.State.GetStorageLatest(finalizedBeaconStateKey, &compactBeaconState)
+	if err != nil {
+		return state.FinalizedHeader{}, fmt.Errorf("fetch FinalizedBeaconState: %w", err)
+	}
+	if compactBeaconState.Slot.Int64() == 0 {
+		return state.FinalizedHeader{}, fmt.Errorf("FinalizedBeaconState not exist at %s", blockRoot.Hex())
+	}
+
+	return state.FinalizedHeader{
+		BeaconSlot:      uint64(compactBeaconState.Slot.Int64()),
+		BeaconBlockRoot: common.Hash(blockRoot),
+	}, nil
 }
 
 func (wr *ParachainWriter) writeToParachain(ctx context.Context, extrinsicName string, payload ...interface{}) (*author.ExtrinsicStatusSubscription, error) {
@@ -187,110 +329,17 @@ func (wr *ParachainWriter) prepExtrinstic(ctx context.Context, extrinsicName str
 	return &extI, nil
 }
 
-func (wr *ParachainWriter) GetLastSyncedSyncCommitteePeriod() (uint64, error) {
-	return wr.getNumberFromParachain("EthereumBeaconClient", "LatestSyncCommitteePeriod")
-}
-
-func (wr *ParachainWriter) GetLastBasicChannelBlockNumber() (uint64, error) {
-	return wr.getNumberFromParachain("BasicInboundChannel", "LatestVerifiedBlockNumber")
-}
-
-func (wr *ParachainWriter) GetLastBasicChannelNonceByAddresses(addresses []common.Address) (map[common.Address]uint64, error) {
-	addressNonceMap := make(map[common.Address]uint64, len(addresses))
-
-	for _, address := range addresses {
-		nonce, err := wr.GetLastBasicChannelNonceByAddress(address)
-		if err != nil {
-			return addressNonceMap, fmt.Errorf("fetch basic channel nonce for address %s: %w", address, err)
-		}
-
-		addressNonceMap[address] = uint64(nonce)
-	}
-
-	return addressNonceMap, nil
-}
-
-func (wr *ParachainWriter) GetLastBasicChannelNonceByAddress(address common.Address) (uint64, error) {
-	key, err := types.CreateStorageKey(wr.conn.Metadata(), "BasicInboundChannel", "Nonce", address[:], nil)
+func (wr *ParachainWriter) prepCall(extrinsicName string, payload ...interface{}) (*types.Call, error) {
+	meta, err := wr.conn.API().RPC.State.GetMetadataLatest()
 	if err != nil {
-		return 0, fmt.Errorf("create storage key for basic channel nonces: %w", err)
+		return nil, err
 	}
 
-	var nonce types.U64
-	_, err = wr.conn.API().RPC.State.GetStorageLatest(key, &nonce)
+	c, err := types.NewCall(meta, extrinsicName, payload...)
 	if err != nil {
-		return 0, fmt.Errorf("get storage for latest basic channel nonces (err): %w", err)
+		return nil, err
 	}
-
-	return uint64(nonce), nil
-}
-
-func (wr *ParachainWriter) GetFinalizedSlots() ([]uint64, error) {
-	key, err := types.CreateStorageKey(wr.conn.Metadata(), "EthereumBeaconClient", "FinalizedBeaconHeaderSlots", nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create storage key for basic channel nonces: %w", err)
-	}
-
-	var slots []types.U64
-	_, err = wr.conn.API().RPC.State.GetStorageLatest(key, &slots)
-	if err != nil {
-		return nil, fmt.Errorf("get storage for latest basic channel nonces (err): %w", err)
-	}
-
-	result := []uint64{}
-	for _, slot := range slots {
-		result = append(result, uint64(slot))
-	}
-
-	return result, nil
-}
-
-func (wr *ParachainWriter) GetLastExecutionHeaderState() (state.ExecutionHeader, error) {
-	key, err := types.CreateStorageKey(wr.conn.Metadata(), "EthereumBeaconClient", "LatestExecutionHeaderState", nil, nil)
-	if err != nil {
-		return state.ExecutionHeader{}, fmt.Errorf("create storage key for LatestExecutionHeaderState: %w", err)
-	}
-
-	var storageState struct {
-		BeaconBlockRoot types.H256
-		BeaconSlot      types.U64
-		BlockHash       types.H256
-		BlockNumber     types.U64
-	}
-	_, err = wr.conn.API().RPC.State.GetStorageLatest(key, &storageState)
-	if err != nil {
-		return state.ExecutionHeader{}, fmt.Errorf("get storage for LatestExecutionHeaderState (err): %w", err)
-	}
-
-	return state.ExecutionHeader{
-		BeaconBlockRoot: common.Hash(storageState.BeaconBlockRoot),
-		BeaconSlot:      uint64(storageState.BeaconSlot),
-		BlockHash:       common.Hash(storageState.BlockHash),
-		BlockNumber:     uint64(storageState.BlockNumber),
-	}, nil
-}
-
-func (wr *ParachainWriter) GetLastFinalizedHeaderState() (state.FinalizedHeader, error) {
-	key, err := types.CreateStorageKey(wr.conn.Metadata(), "EthereumBeaconClient", "LatestFinalizedHeaderState", nil, nil)
-	if err != nil {
-		return state.FinalizedHeader{}, fmt.Errorf("create storage key for GetLastFinalizedHeaderState: %w", err)
-	}
-
-	var storageState struct {
-		BeaconBlockRoot types.H256
-		BeaconSlot      types.U64
-		ImportTime      types.U64
-	}
-	_, err = wr.conn.API().RPC.State.GetStorageLatest(key, &storageState)
-	if err != nil {
-		return state.FinalizedHeader{}, fmt.Errorf("get storage for GetLastFinalizedHeaderState (err): %w", err)
-	}
-
-	return state.FinalizedHeader{
-		BeaconBlockRoot: common.Hash(storageState.BeaconBlockRoot),
-		BeaconSlot:      uint64(storageState.BeaconSlot),
-		ImportTime:      uint64(storageState.ImportTime),
-	}, nil
+	return &c, nil
 }
 
 func (wr *ParachainWriter) getHashFromParachain(pallet, storage string) (common.Hash, error) {
@@ -321,4 +370,38 @@ func (wr *ParachainWriter) getNumberFromParachain(pallet, storage string) (uint6
 	}
 
 	return uint64(number), nil
+}
+
+func (wr *ParachainWriter) GetLastFinalizedStateIndex() (types.U32, error) {
+	var index types.U32
+	key, err := types.CreateStorageKey(wr.conn.Metadata(), "EthereumBeaconClient", "FinalizedBeaconStateIndex", nil, nil)
+	if err != nil {
+		return index, fmt.Errorf("create storage key for FinalizedBeaconStateIndex: %w", err)
+	}
+
+	_, err = wr.conn.API().RPC.State.GetStorageLatest(key, &index)
+	if err != nil {
+		return index, fmt.Errorf("get storage for FinalizedBeaconStateIndex (err): %w", err)
+	}
+
+	return index, nil
+}
+
+func (wr *ParachainWriter) GetFinalizedBeaconRootByIndex(index uint32) (types.H256, error) {
+	var beaconRoot types.H256
+	encodedIndex, err := types.EncodeToBytes(types.NewU32(index))
+	if err != nil {
+		return beaconRoot, fmt.Errorf("get finalized beacon root encode index error: %w", err)
+	}
+	key, err := types.CreateStorageKey(wr.conn.Metadata(), "EthereumBeaconClient", "FinalizedBeaconStateMapping", encodedIndex, nil)
+	if err != nil {
+		return beaconRoot, fmt.Errorf("create storage key for FinalizedBeaconStateMapping: %w", err)
+	}
+
+	_, err = wr.conn.API().RPC.State.GetStorageLatest(key, &beaconRoot)
+	if err != nil {
+		return beaconRoot, fmt.Errorf("get storage for FinalizedBeaconStateMapping (err): %w", err)
+	}
+
+	return beaconRoot, nil
 }

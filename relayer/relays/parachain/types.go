@@ -1,13 +1,12 @@
 package parachain
 
 import (
-	"fmt"
 	"math/big"
-	"math/bits"
 
+	"github.com/snowfork/go-substrate-rpc-client/v4/scale"
 	"github.com/snowfork/go-substrate-rpc-client/v4/types"
 	"github.com/snowfork/snowbridge/relayer/chain/relaychain"
-	"github.com/snowfork/snowbridge/relayer/contracts/basic"
+	"github.com/snowfork/snowbridge/relayer/contracts"
 	"github.com/snowfork/snowbridge/relayer/crypto/merkle"
 )
 
@@ -19,8 +18,8 @@ type Task struct {
 	ProofInput *ProofInput
 	// Outputs of MMR proof generation
 	ProofOutput *ProofOutput
-	// Commitments for basic channel
-	BasicChannelProofs *[]MessageProof
+	// Proofs for messages from outbound channel on Polkadot
+	MessageProofs *[]MessageProof
 }
 
 // A ProofInput is data needed to generate a proof of parachain header inclusion
@@ -29,6 +28,8 @@ type ProofInput struct {
 	ParaID uint32
 	// Relay chain block number in which our parachain head was included
 	RelayBlockNumber uint64
+	// Relay chain block hash in which our parachain head was included
+	RelayBlockHash types.Hash
 	// All included paraheads in RelayBlockNumber
 	ParaHeads []relaychain.ParaHead
 }
@@ -41,18 +42,30 @@ type ProofOutput struct {
 	MerkleProofData MerkleProofData
 }
 
+type OptionRawMerkleProof struct {
+	HasValue bool
+	Value    RawMerkleProof
+}
+
+func (o OptionRawMerkleProof) Encode(encoder scale.Encoder) error {
+	return encoder.EncodeOption(o.HasValue, o.Value)
+}
+
+func (o *OptionRawMerkleProof) Decode(decoder scale.Decoder) error {
+	return decoder.DecodeOption(&o.HasValue, &o.Value)
+}
+
 type RawMerkleProof struct {
 	Root           types.H256
 	Proof          []types.H256
 	NumberOfLeaves uint64
 	LeafIndex      uint64
-	Leaf           []byte
+	Leaf           types.H256
 }
 
 type MerkleProof struct {
 	Root        types.H256
 	InnerHashes [][32]byte
-	HashSides   []bool
 }
 
 func NewMerkleProof(rawProof RawMerkleProof) (MerkleProof, error) {
@@ -63,81 +76,91 @@ func NewMerkleProof(rawProof RawMerkleProof) (MerkleProof, error) {
 		byteArrayProof[i] = ([32]byte)(rawProof.Proof[i])
 	}
 
-	hashSides, err := generateHashSides(rawProof.LeafIndex, rawProof.NumberOfLeaves)
-	if err != nil {
-		return proof, err
-	}
-
 	proof = MerkleProof{
 		Root:        rawProof.Root,
 		InnerHashes: byteArrayProof,
-		HashSides:   hashSides,
 	}
 
 	return proof, nil
 }
 
-type BasicOutboundChannelMessage struct {
-	SourceID types.AccountID
-	Nonce    types.UCompact
-	Payload  []byte
+type OutboundQueueMessage struct {
+	ChannelID      types.H256
+	Nonce          uint64
+	Command        uint8
+	Params         []byte
+	MaxDispatchGas uint64
+	MaxFeePerGas   types.U128
+	Reward         types.U128
+	ID             types.Bytes32
 }
 
-func (m BasicOutboundChannelMessage) IntoInboundMessage() basic.BasicInboundChannelMessage {
-	return basic.BasicInboundChannelMessage{
-		SourceID: m.SourceID,
-		Nonce:    (*big.Int)(&m.Nonce).Uint64(),
-		Payload:  m.Payload,
+func (m OutboundQueueMessage) IntoInboundMessage() contracts.InboundMessage {
+	return contracts.InboundMessage{
+		ChannelID:      m.ChannelID,
+		Nonce:          m.Nonce,
+		Command:        m.Command,
+		Params:         m.Params,
+		MaxDispatchGas: m.MaxDispatchGas,
+		MaxFeePerGas:   m.MaxFeePerGas.Int,
+		Reward:         m.Reward.Int,
+		Id:             m.ID,
 	}
+}
+
+func (m OutboundQueueMessage) Encode(encoder scale.Encoder) error {
+	encoder.Encode(m.ChannelID)
+	encoder.EncodeUintCompact(*big.NewInt(0).SetUint64(m.Nonce))
+	encoder.Encode(m.Command)
+	encoder.Encode(m.Params)
+	encoder.EncodeUintCompact(*big.NewInt(0).SetUint64(m.MaxDispatchGas))
+	encoder.EncodeUintCompact(*m.MaxFeePerGas.Int)
+	encoder.EncodeUintCompact(*m.Reward.Int)
+	encoder.Encode(m.ID)
+	return nil
+}
+
+func (m *OutboundQueueMessage) Decode(decoder scale.Decoder) error {
+	err := decoder.Decode(&m.ChannelID)
+	if err != nil {
+		return err
+	}
+	decoded, err := decoder.DecodeUintCompact()
+	if err != nil {
+		return err
+	}
+	m.Nonce = decoded.Uint64()
+	err = decoder.Decode(&m.Command)
+	if err != nil {
+		return err
+	}
+	err = decoder.Decode(&m.Params)
+	if err != nil {
+		return err
+	}
+	decoded, err = decoder.DecodeUintCompact()
+	if err != nil {
+		return err
+	}
+	m.MaxDispatchGas = decoded.Uint64()
+	decoded, err = decoder.DecodeUintCompact()
+	if err != nil {
+		return err
+	}
+	m.MaxFeePerGas = types.U128{Int: decoded}
+	decoded, err = decoder.DecodeUintCompact()
+	if err != nil {
+		return err
+	}
+	m.Reward = types.U128{Int: decoded}
+	err = decoder.Decode(&m.ID)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 type MessageProof struct {
-	Message BasicOutboundChannelMessage
+	Message OutboundQueueMessage
 	Proof   MerkleProof
-}
-
-func generateHashSides(nodePosition uint64, breadth uint64) ([]bool, error) {
-	if nodePosition >= breadth {
-		return nil, fmt.Errorf("leaf position %v is too high in proof with %v leaves", nodePosition, breadth)
-	}
-
-	// The height of a complete tree (eg. the Merkle tree we have here) is the base 2 log of the number of leaves, rounded up.
-	// This is equivalent to the number of bits that aren't leading zeroes in breadth - 1, which we use here.
-	treeHeight := 64 - bits.LeadingZeros64(breadth-1)
-	// The number of leaves in the next-largest perfect tree after the current complete tree.
-	perfectTreeBreadth := uint64(1 << treeHeight)
-
-	// map node position in complete tree to left child in the next-largest perfect tree.
-	// Then skip the first side to get back to the sides for the node in the complete tree.
-
-	// The bottom level has 2 nodes for every 1 node the tree has over the next-smaller perfect tree.
-	bottomLevelWidth := 2 * (breadth - (perfectTreeBreadth / 2))
-	// Nodes on the bottom level have depth equal to tree height.
-	// In a complete tree, the nodes on the bottom level are as far left as possible, so their position must be less than the number of
-	// nodes on the bottom level.
-	nodeDepthIsTreeHeight := nodePosition < bottomLevelWidth
-
-	// The number of intermediate hashes for a leaf is the depth of that leaf.
-	// Since the tree is complete, this depth is either the height of the tree, or height - 1.
-	var nodeDepth int
-	if nodeDepthIsTreeHeight {
-		// same as a perfect tree
-		nodeDepth = treeHeight
-	} else {
-		// like a perfect tree, but skip the first iteration
-		nodeDepth = treeHeight - 1
-		nodePosition -= bottomLevelWidth / 2
-		breadth = ((breadth - 1) / 2) + 1
-	}
-
-	sides := make([]bool, nodeDepth)
-	for i := 0; i < nodeDepth; i++ {
-		// sides[i] is true when the proof hash is on the left and false when on the right.
-		// this is the same as being true when the node hash is on the right and false when on the left, which we use here.
-		sides[i] = nodePosition%2 == 1
-		nodePosition /= 2
-		breadth = ((breadth - 1) / 2) + 1
-	}
-
-	return sides, nil
 }

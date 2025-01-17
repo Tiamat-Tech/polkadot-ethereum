@@ -1,18 +1,16 @@
 package api
 
 import (
-	"encoding/hex"
 	"fmt"
 	"math/big"
 	"strconv"
-	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/snowfork/go-substrate-rpc-client/v4/types"
 	beaconjson "github.com/snowfork/snowbridge/relayer/relays/beacon/header/syncer/json"
 	"github.com/snowfork/snowbridge/relayer/relays/beacon/header/syncer/scale"
-	"github.com/snowfork/snowbridge/relayer/relays/beacon/header/syncer/util"
 	"github.com/snowfork/snowbridge/relayer/relays/beacon/state"
+	"github.com/snowfork/snowbridge/relayer/relays/util"
 )
 
 type SyncCommitteePeriodUpdateResponse struct {
@@ -31,46 +29,57 @@ type SyncCommitteePeriodUpdateResponse struct {
 	} `json:"data"`
 }
 
+type BeaconBlockResponseData struct {
+	Message BeaconBlockResponseMessage `json:"message"`
+}
+
+type BeaconBlockResponseMessage struct {
+	Slot          string                  `json:"slot"`
+	ProposerIndex string                  `json:"proposer_index"`
+	ParentRoot    string                  `json:"parent_root"`
+	StateRoot     string                  `json:"state_root"`
+	Body          BeaconBlockResponseBody `json:"body"`
+}
+
+type BeaconBlockResponseBody struct {
+	RandaoReveal string `json:"randao_reveal"`
+	Eth1Data     struct {
+		DepositRoot  string `json:"deposit_root"`
+		DepositCount string `json:"deposit_count"`
+		BlockHash    string `json:"block_hash"`
+	} `json:"eth1_data"`
+	Graffiti          string                        `json:"graffiti"`
+	ProposerSlashings []ProposerSlashingResponse    `json:"proposer_slashings"`
+	AttesterSlashings []AttesterSlashingResponse    `json:"attester_slashings"`
+	Attestations      []AttestationResponse         `json:"attestations"`
+	Deposits          []DepositResponse             `json:"deposits"`
+	VoluntaryExits    []SignedVoluntaryExitResponse `json:"voluntary_exits"`
+	SyncAggregate     SyncAggregateResponse         `json:"sync_aggregate"`
+	ExecutionPayload  struct {
+		ParentHash    string               `json:"parent_hash"`
+		FeeRecipient  string               `json:"fee_recipient"`
+		StateRoot     string               `json:"state_root"`
+		ReceiptsRoot  string               `json:"receipts_root"`
+		LogsBloom     string               `json:"logs_bloom"`
+		PrevRandao    string               `json:"prev_randao"`
+		BlockNumber   string               `json:"block_number"`
+		GasLimit      string               `json:"gas_limit"`
+		GasUsed       string               `json:"gas_used"`
+		Timestamp     string               `json:"timestamp"`
+		ExtraData     string               `json:"extra_data"`
+		BaseFeePerGas string               `json:"base_fee_per_gas"`
+		BlockHash     string               `json:"block_hash"`
+		Transactions  []string             `json:"transactions"`
+		Withdrawals   []WithdrawalResponse `json:"withdrawals"`
+		BlobGasUsed   string               `json:"blob_gas_used,omitempty"`
+		ExcessBlobGas string               `json:"excess_blob_gas,omitempty"`
+	} `json:"execution_payload"`
+	BlsToExecutionChanges []SignedBLSToExecutionChangeResponse `json:"bls_to_execution_changes"`
+	BlobKzgCommitments    []string                             `json:"blob_kzg_commitments"`
+}
+
 type BeaconBlockResponse struct {
-	Data struct {
-		Message struct {
-			Slot          string `json:"slot"`
-			ProposerIndex string `json:"proposer_index"`
-			ParentRoot    string `json:"parent_root"`
-			StateRoot     string `json:"state_root"`
-			Body          struct {
-				RandaoReveal string `json:"randao_reveal"`
-				Eth1Data     struct {
-					DepositRoot  string `json:"deposit_root"`
-					DepositCount string `json:"deposit_count"`
-					BlockHash    string `json:"block_hash"`
-				} `json:"eth1_data"`
-				Graffiti          string                     `json:"graffiti"`
-				ProposerSlashings []ProposerSlashingResponse `json:"proposer_slashings"`
-				AttesterSlashings []AttesterSlashingResponse `json:"attester_slashings"`
-				Attestations      []AttestationResponse      `json:"attestations"`
-				Deposits          []DepositResponse          `json:"deposits"`
-				VoluntaryExits    []VoluntaryExitResponse    `json:"voluntary_exits"`
-				SyncAggregate     SyncAggregateResponse      `json:"sync_aggregate"`
-				ExecutionPayload  struct {
-					ParentHash    string   `json:"parent_hash"`
-					FeeRecipient  string   `json:"fee_recipient"`
-					StateRoot     string   `json:"state_root"`
-					ReceiptsRoot  string   `json:"receipts_root"`
-					LogsBloom     string   `json:"logs_bloom"`
-					PrevRandao    string   `json:"prev_randao"`
-					BlockNumber   string   `json:"block_number"`
-					GasLimit      string   `json:"gas_limit"`
-					GasUsed       string   `json:"gas_used"`
-					Timestamp     string   `json:"timestamp"`
-					ExtraData     string   `json:"extra_data"`
-					BaseFeePerGas string   `json:"base_fee_per_gas"`
-					BlockHash     string   `json:"block_hash"`
-					Transactions  []string `json:"transactions"`
-				} `json:"execution_payload"`
-			} `json:"body"`
-		} `json:"message"`
-	} `json:"data"`
+	Data BeaconBlockResponseData `json:"data"`
 }
 
 type BootstrapResponse struct {
@@ -93,7 +102,7 @@ type FinalizedCheckpointResponse struct {
 
 type SignedHeaderResponse struct {
 	Message   HeaderResponse `json:"message"`
-	Signature []byte         `json:"signature"`
+	Signature string         `json:"signature"`
 }
 
 type CheckpointResponse struct {
@@ -141,6 +150,11 @@ type AttestationResponse struct {
 	AggregationBits string                  `json:"aggregation_bits"`
 	Data            AttestationDataResponse `json:"data"`
 	Signature       string                  `json:"signature"`
+}
+
+type SignedVoluntaryExitResponse struct {
+	Message   VoluntaryExitResponse `json:"message"`
+	Signature string                `json:"signature"`
 }
 
 type VoluntaryExitResponse struct {
@@ -292,6 +306,104 @@ func (h *HeaderResponse) ToScale() (scale.BeaconHeader, error) {
 	}, nil
 }
 
+type WithdrawalResponse struct {
+	Index          string `json:"index"`
+	ValidatorIndex string `json:"validator_index"`
+	Address        string `json:"address"`
+	Amount         string `json:"amount"`
+}
+
+type BLSToExecutionChangeResponse struct {
+	ValidatorIndex     string `json:"validator_index"`
+	FromBlsPubkey      string `json:"from_bls_pubkey"`
+	ToExecutionAddress string `json:"to_execution_address"`
+}
+
+type SignedBLSToExecutionChangeResponse struct {
+	Message   *BLSToExecutionChangeResponse `json:"message,omitempty"`
+	Signature string                        `json:"signature,omitempty"`
+}
+
+func (s *SignedBLSToExecutionChangeResponse) ToFastSSZ() (*state.SignedBLSToExecutionChange, error) {
+	validateIndex, err := util.ToUint64(s.Message.ValidatorIndex)
+	if err != nil {
+		return nil, err
+	}
+	pubKey, err := util.HexStringToPublicKey(s.Message.FromBlsPubkey)
+	if err != nil {
+		return nil, err
+	}
+	address, err := util.HexStringTo20Bytes(s.Message.ToExecutionAddress)
+	if err != nil {
+		return nil, err
+	}
+	signature, err := util.HexStringTo96Bytes(s.Signature)
+	if err != nil {
+		return nil, err
+	}
+	return &state.SignedBLSToExecutionChange{Message: &state.BLSToExecutionChange{ValidatorIndex: validateIndex, FromBlsPubkey: pubKey[:], ToExecutionAddress: address[:]}, Signature: signature[:]}, nil
+}
+
+func (w *WithdrawalResponse) ToFastSSZ() (*state.Withdrawal, error) {
+	index, err := util.ToUint64(w.Index)
+	if err != nil {
+		return nil, err
+	}
+	validatorIndex, err := util.ToUint64(w.ValidatorIndex)
+	if err != nil {
+		return nil, err
+	}
+	address, err := util.HexStringTo20Bytes(w.Address)
+	if err != nil {
+		return nil, err
+	}
+	amount, err := util.ToUint64(w.Amount)
+	if err != nil {
+		return nil, err
+	}
+	return &state.Withdrawal{
+		Index:          index,
+		ValidatorIndex: validatorIndex,
+		Address:        address,
+		Amount:         amount,
+	}, nil
+}
+
+func (h *HeaderResponse) ToFastSSZ() (*state.BeaconBlockHeader, error) {
+	slot, err := util.ToUint64(h.Slot)
+	if err != nil {
+		return nil, err
+	}
+
+	proposerIndex, err := util.ToUint64(h.ProposerIndex)
+	if err != nil {
+		return nil, err
+	}
+
+	parentRoot, err := util.HexStringToByteArray(h.ParentRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	stateRoot, err := util.HexStringToByteArray(h.StateRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	bodyRoot, err := util.HexStringToByteArray(h.BodyRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	return &state.BeaconBlockHeader{
+		Slot:          slot,
+		ProposerIndex: proposerIndex,
+		ParentRoot:    parentRoot,
+		StateRoot:     stateRoot,
+		BodyRoot:      bodyRoot,
+	}, nil
+}
+
 func (h BeaconHeader) ToScale() (scale.BeaconHeader, error) {
 	return scale.BeaconHeader{
 		Slot:          types.NewU64(h.Slot),
@@ -336,358 +448,533 @@ func (s SyncAggregateResponse) ToScale() (scale.SyncAggregate, error) {
 		return scale.SyncAggregate{}, err
 	}
 
+	var syncCommitteeSignature [96]byte
+	copy(syncCommitteeSignature[:], aggregateSignature)
+
 	return scale.SyncAggregate{
 		SyncCommitteeBits:      bits,
-		SyncCommitteeSignature: aggregateSignature,
+		SyncCommitteeSignature: syncCommitteeSignature,
 	}, nil
 }
 
-func (b BeaconBlockResponse) ToScale() (scale.BeaconBlock, error) {
-	dataMessage := b.Data.Message
+// ToFastSSZ can be removed once Lodestar supports returning block data as SSZ instead of JSON only.
+// Because it only returns JSON, we need this interim step where we convert the block JSON to the data
+// types that the FastSSZ lib expects. When Lodestar supports SSZ block response, we can remove all these
+// and directly unmarshal SSZ bytes to state.BeaconBlock.
+func (b BeaconBlockResponse) ToFastSSZ(isDeneb bool) (state.BeaconBlock, error) {
+	data := b.Data.Message
 
-	slot, err := util.ToUint64(dataMessage.Slot)
+	slot, err := util.ToUint64(data.Slot)
 	if err != nil {
-		return scale.BeaconBlock{}, fmt.Errorf("parse slot as int: %w", err)
+		return nil, err
 	}
 
-	proposerIndex, err := util.ToUint64(dataMessage.ProposerIndex)
+	proposerIndex, err := util.ToUint64(data.ProposerIndex)
 	if err != nil {
-		return scale.BeaconBlock{}, fmt.Errorf("parse proposerIndex as int: %w", err)
+		return nil, err
 	}
 
-	body := dataMessage.Body
-
-	syncAggregate, err := body.SyncAggregate.ToScale()
+	parentRoot, err := util.HexStringToByteArray(data.ParentRoot)
 	if err != nil {
-		return scale.BeaconBlock{}, err
+		return nil, err
 	}
 
-	proposerSlashings := []scale.ProposerSlashing{}
+	stateRoot, err := util.HexStringToByteArray(data.StateRoot)
+	if err != nil {
+		return nil, err
+	}
 
+	body := data.Body
+
+	randaoReveal, err := util.HexStringToByteArray(body.RandaoReveal)
+	if err != nil {
+		return nil, err
+	}
+
+	eth1DepositRoot, err := util.HexStringToByteArray(body.Eth1Data.DepositRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	eth1DepositCount, err := util.ToUint64(body.Eth1Data.DepositCount)
+	if err != nil {
+		return nil, err
+	}
+
+	eth1BlockHash, err := util.HexStringToByteArray(body.Eth1Data.BlockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	graffiti, err := util.HexStringTo32Bytes(body.Graffiti)
+	if err != nil {
+		return nil, err
+	}
+
+	proposerSlashings := []*state.ProposerSlashing{}
 	for _, proposerSlashing := range body.ProposerSlashings {
-		proposerSlashingScale, err := proposerSlashing.ToScale()
+		proposerSlashingSSZ, err := proposerSlashing.ToFastSSZ()
 		if err != nil {
-			return scale.BeaconBlock{}, err
+			return nil, err
 		}
 
-		proposerSlashings = append(proposerSlashings, proposerSlashingScale)
+		proposerSlashings = append(proposerSlashings, proposerSlashingSSZ)
 	}
 
-	attesterSlashings := []scale.AttesterSlashing{}
-
+	attesterSlashings := []*state.AttesterSlashing{}
 	for _, attesterSlashing := range body.AttesterSlashings {
-		attesterSlashingScale, err := attesterSlashing.ToScale()
+		attesterSlashingSSZ, err := attesterSlashing.ToFastSSZ()
 		if err != nil {
-			return scale.BeaconBlock{}, err
+			return nil, err
 		}
 
-		attesterSlashings = append(attesterSlashings, attesterSlashingScale)
+		attesterSlashings = append(attesterSlashings, attesterSlashingSSZ)
 	}
 
-	attestations := []scale.Attestation{}
-
+	attestations := []*state.Attestation{}
 	for _, attestation := range body.Attestations {
-		attestationScale, err := attestation.ToScale()
+		attestationSSZ, err := attestation.ToFastSSZ()
 		if err != nil {
-			return scale.BeaconBlock{}, err
+			return nil, err
 		}
 
-		attestations = append(attestations, attestationScale)
+		attestations = append(attestations, attestationSSZ)
 	}
 
-	deposits := []scale.Deposit{}
-
+	deposits := []*state.Deposit{}
 	for _, deposit := range body.Deposits {
-		depositScale, err := deposit.ToScale()
+		depositScale, err := deposit.ToFastSSZ()
 		if err != nil {
-			return scale.BeaconBlock{}, err
+			return nil, err
 		}
 
 		deposits = append(deposits, depositScale)
 	}
 
-	voluntaryExits := []scale.VoluntaryExit{}
-
+	voluntaryExits := []*state.SignedVoluntaryExit{}
 	for _, voluntaryExit := range body.VoluntaryExits {
-		voluntaryExitScale, err := voluntaryExit.ToScale()
+		voluntaryExitSSZ, err := voluntaryExit.ToFastSSZ()
 		if err != nil {
-			return scale.BeaconBlock{}, err
+			return nil, err
 		}
 
-		voluntaryExits = append(voluntaryExits, voluntaryExitScale)
-	}
-
-	depositCount, err := util.ToUint64(body.Eth1Data.DepositCount)
-	if err != nil {
-		return scale.BeaconBlock{}, err
+		voluntaryExits = append(voluntaryExits, voluntaryExitSSZ)
 	}
 
 	executionPayload := body.ExecutionPayload
-
-	baseFeePerGasUint64, err := util.ToUint64(executionPayload.BaseFeePerGas)
+	parentHash, err := util.HexStringTo32Bytes(executionPayload.ParentHash)
 	if err != nil {
-		return scale.BeaconBlock{}, err
+		return nil, err
 	}
 
-	bigInt := big.NewInt(int64(baseFeePerGasUint64))
-
-	blockNumber, err := util.ToUint64(executionPayload.BlockNumber)
+	executionStateRoot, err := util.HexStringTo32Bytes(executionPayload.StateRoot)
 	if err != nil {
-		return scale.BeaconBlock{}, err
+		return nil, err
 	}
 
-	gasLimit, err := util.ToUint64(executionPayload.GasLimit)
+	receiptsRoot, err := util.HexStringTo32Bytes(executionPayload.ReceiptsRoot)
 	if err != nil {
-		return scale.BeaconBlock{}, err
+		return nil, err
 	}
 
-	gasUsed, err := util.ToUint64(executionPayload.GasUsed)
+	prevRando, err := util.HexStringTo32Bytes(executionPayload.PrevRandao)
 	if err != nil {
-		return scale.BeaconBlock{}, err
+		return nil, err
 	}
 
-	timestamp, err := util.ToUint64(executionPayload.Timestamp)
-	if err != nil {
-		return scale.BeaconBlock{}, err
+	n := new(big.Int)
+	n, ok := n.SetString(executionPayload.BaseFeePerGas, 10)
+	if !ok {
+		return nil, err
 	}
 
-	transactionsRoot, err := getTransactionsHashTreeRoot(executionPayload.Transactions)
+	// FastSSZ expects a little endian byte array
+	baseFeePerGas := util.ChangeByteOrder(n.Bytes())
+
+	var baseFeePerGasBytes [32]byte
+	copy(baseFeePerGasBytes[:], baseFeePerGas)
+
+	blockHash, err := util.HexStringTo32Bytes(executionPayload.BlockHash)
 	if err != nil {
-		return scale.BeaconBlock{}, err
+		return nil, err
 	}
 
-	randaoReveal, err := util.HexStringToByteArray(body.RandaoReveal)
+	feeRecipient, err := util.HexStringTo20Bytes(executionPayload.FeeRecipient)
 	if err != nil {
-		return scale.BeaconBlock{}, err
+		return nil, err
 	}
 
-	feeRecipient, err := util.HexStringToByteArray(executionPayload.FeeRecipient)
+	logsBloom, err := util.HexStringTo256Bytes(executionPayload.LogsBloom)
 	if err != nil {
-		return scale.BeaconBlock{}, err
-	}
-
-	logsBloom, err := util.HexStringToByteArray(executionPayload.LogsBloom)
-	if err != nil {
-		return scale.BeaconBlock{}, err
+		return nil, err
 	}
 
 	extraData, err := util.HexStringToByteArray(executionPayload.ExtraData)
 	if err != nil {
-		return scale.BeaconBlock{}, err
+		return nil, err
 	}
 
-	return scale.BeaconBlock{
-		Slot:          types.NewU64(slot),
-		ProposerIndex: types.NewU64(proposerIndex),
-		ParentRoot:    types.NewH256(common.HexToHash(dataMessage.ParentRoot).Bytes()),
-		StateRoot:     types.NewH256(common.HexToHash(dataMessage.StateRoot).Bytes()),
-		Body: scale.Body{
-			RandaoReveal: randaoReveal,
-			Eth1Data: scale.Eth1Data{
-				DepositRoot:  types.NewH256(common.HexToHash(body.Eth1Data.DepositRoot).Bytes()),
-				DepositCount: types.NewU64(depositCount),
-				BlockHash:    types.NewH256(common.HexToHash(body.Eth1Data.BlockHash).Bytes()),
+	transactions := [][]byte{}
+	for _, transaction := range executionPayload.Transactions {
+		transactionSSZ, err := util.HexStringToByteArray(transaction)
+		if err != nil {
+			return nil, err
+		}
+
+		transactions = append(transactions, transactionSSZ)
+	}
+
+	withdrawals := []*state.Withdrawal{}
+	for _, withdrawalResponse := range executionPayload.Withdrawals {
+		withdrawalSSZ, err := withdrawalResponse.ToFastSSZ()
+		if err != nil {
+			return nil, err
+		}
+		withdrawals = append(withdrawals, withdrawalSSZ)
+	}
+
+	blockNumber, err := util.ToUint64(executionPayload.BlockNumber)
+	if err != nil {
+		return nil, err
+	}
+
+	gasLimit, err := util.ToUint64(executionPayload.GasLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	gasUsed, err := util.ToUint64(executionPayload.GasUsed)
+	if err != nil {
+		return nil, err
+	}
+
+	timestamp, err := util.ToUint64(executionPayload.Timestamp)
+	if err != nil {
+		return nil, err
+	}
+
+	blobGasUsed, err := util.ToUint64AllowEmpty(executionPayload.BlobGasUsed)
+	if err != nil {
+		return nil, err
+	}
+
+	excessBlobGas, err := util.ToUint64AllowEmpty(executionPayload.ExcessBlobGas)
+	if err != nil {
+		return nil, err
+	}
+
+	syncCommitteeBits, err := util.HexStringToByteArray(body.SyncAggregate.SyncCommitteeBits)
+	if err != nil {
+		return nil, err
+	}
+
+	syncCommitteeSignature, err := util.HexStringTo96Bytes(body.SyncAggregate.SyncCommitteeSignature)
+	if err != nil {
+		return nil, err
+	}
+
+	blsExecutionChanges := []*state.SignedBLSToExecutionChange{}
+	for _, changeResponse := range body.BlsToExecutionChanges {
+		changeSSZ, err := changeResponse.ToFastSSZ()
+		if err != nil {
+			return nil, err
+		}
+		blsExecutionChanges = append(blsExecutionChanges, changeSSZ)
+	}
+
+	var kzgCommitments [][48]byte
+	for _, kzgCommitment := range body.BlobKzgCommitments {
+		kzgCommitmentSSZ, err := util.HexStringTo48Bytes(kzgCommitment)
+		if err != nil {
+			return nil, err
+		}
+		kzgCommitments = append(kzgCommitments, kzgCommitmentSSZ)
+	}
+
+	if isDeneb {
+		return &state.BeaconBlockDenebMainnet{
+			Slot:          slot,
+			ProposerIndex: proposerIndex,
+			ParentRoot:    parentRoot,
+			StateRoot:     stateRoot,
+			Body: &state.BeaconBlockBodyDenebMainnet{
+				RandaoReveal: randaoReveal,
+				Eth1Data: &state.Eth1Data{
+					DepositRoot:  eth1DepositRoot,
+					DepositCount: eth1DepositCount,
+					BlockHash:    eth1BlockHash,
+				},
+				Graffiti:          graffiti,
+				ProposerSlashings: proposerSlashings,
+				AttesterSlashings: attesterSlashings,
+				Attestations:      attestations,
+				Deposits:          deposits,
+				VoluntaryExits:    voluntaryExits,
+				SyncAggregate: &state.SyncAggregateMainnet{
+					SyncCommitteeBits:      syncCommitteeBits,
+					SyncCommitteeSignature: syncCommitteeSignature,
+				},
+				ExecutionPayload: &state.ExecutionPayloadDeneb{
+					ParentHash:    parentHash,
+					FeeRecipient:  feeRecipient,
+					StateRoot:     executionStateRoot,
+					ReceiptsRoot:  receiptsRoot,
+					LogsBloom:     logsBloom,
+					PrevRandao:    prevRando,
+					BlockNumber:   blockNumber,
+					GasLimit:      gasLimit,
+					GasUsed:       gasUsed,
+					Timestamp:     timestamp,
+					ExtraData:     extraData,
+					BaseFeePerGas: baseFeePerGasBytes,
+					BlockHash:     blockHash,
+					Transactions:  transactions,
+					Withdrawals:   withdrawals,
+					BlobGasUsed:   blobGasUsed,   // new for Deneb
+					ExcessBlobGas: excessBlobGas, // new for Deneb
+				},
+				BlsToExecutionChanges: blsExecutionChanges,
+				BlobKzgCommitments:    kzgCommitments, // new for Deneb
 			},
-			Graffiti:          types.NewH256(common.HexToHash(body.Graffiti).Bytes()),
+		}, nil
+	}
+	return &state.BeaconBlockCapellaMainnet{
+		Slot:          slot,
+		ProposerIndex: proposerIndex,
+		ParentRoot:    parentRoot,
+		StateRoot:     stateRoot,
+		Body: &state.BeaconBlockBodyCapellaMainnet{
+			RandaoReveal: randaoReveal,
+			Eth1Data: &state.Eth1Data{
+				DepositRoot:  eth1DepositRoot,
+				DepositCount: eth1DepositCount,
+				BlockHash:    eth1BlockHash,
+			},
+			Graffiti:          graffiti,
 			ProposerSlashings: proposerSlashings,
 			AttesterSlashings: attesterSlashings,
 			Attestations:      attestations,
 			Deposits:          deposits,
 			VoluntaryExits:    voluntaryExits,
-			SyncAggregate:     syncAggregate,
-			ExecutionPayload: scale.ExecutionPayload{
-				ParentHash:       types.NewH256(common.HexToHash(executionPayload.ParentHash).Bytes()),
-				FeeRecipient:     feeRecipient,
-				StateRoot:        types.NewH256(common.HexToHash(executionPayload.StateRoot).Bytes()),
-				ReceiptsRoot:     types.NewH256(common.HexToHash(executionPayload.ReceiptsRoot).Bytes()),
-				LogsBloom:        logsBloom,
-				PrevRandao:       types.NewH256(common.HexToHash(executionPayload.PrevRandao).Bytes()),
-				BlockNumber:      types.NewU64(blockNumber),
-				GasLimit:         types.NewU64(gasLimit),
-				GasUsed:          types.NewU64(gasUsed),
-				Timestamp:        types.NewU64(timestamp),
-				ExtraData:        extraData,
-				BaseFeePerGas:    types.NewU256(*bigInt),
-				BlockHash:        types.NewH256(common.HexToHash(executionPayload.BlockHash).Bytes()),
-				TransactionsRoot: transactionsRoot,
+			SyncAggregate: &state.SyncAggregateMainnet{
+				SyncCommitteeBits:      syncCommitteeBits,
+				SyncCommitteeSignature: syncCommitteeSignature,
 			},
+			ExecutionPayload: &state.ExecutionPayloadCapella{
+				ParentHash:    parentHash,
+				FeeRecipient:  feeRecipient,
+				StateRoot:     executionStateRoot,
+				ReceiptsRoot:  receiptsRoot,
+				LogsBloom:     logsBloom,
+				PrevRandao:    prevRando,
+				BlockNumber:   blockNumber,
+				GasLimit:      gasLimit,
+				GasUsed:       gasUsed,
+				Timestamp:     timestamp,
+				ExtraData:     extraData,
+				BaseFeePerGas: baseFeePerGasBytes,
+				BlockHash:     blockHash,
+				Transactions:  transactions,
+				Withdrawals:   withdrawals, // new for Capella
+			},
+			BlsToExecutionChanges: blsExecutionChanges, // new for Capella
 		},
 	}, nil
 }
 
-func (p ProposerSlashingResponse) ToScale() (scale.ProposerSlashing, error) {
-	signedHeader1, err := p.SignedHeader1.ToScale()
+func (p ProposerSlashingResponse) ToFastSSZ() (*state.ProposerSlashing, error) {
+	signedHeader1, err := p.SignedHeader1.ToFastSSZ()
 	if err != nil {
-		return scale.ProposerSlashing{}, err
+		return nil, err
 	}
 
-	signedHeader2, err := p.SignedHeader2.ToScale()
+	signedHeader2, err := p.SignedHeader2.ToFastSSZ()
 	if err != nil {
-		return scale.ProposerSlashing{}, err
+		return nil, err
 	}
 
-	return scale.ProposerSlashing{
-		SignedHeader1: signedHeader1,
-		SignedHeader2: signedHeader2,
+	return &state.ProposerSlashing{
+		Header1: signedHeader1,
+		Header2: signedHeader2,
 	}, nil
 }
 
-func (a AttesterSlashingResponse) ToScale() (scale.AttesterSlashing, error) {
-	attestation1, err := a.Attestation1.ToScale()
+func (a AttesterSlashingResponse) ToFastSSZ() (*state.AttesterSlashing, error) {
+	attestation1, err := a.Attestation1.ToFastSSZ()
 	if err != nil {
-		return scale.AttesterSlashing{}, err
+		return nil, err
 	}
 
-	attestation2, err := a.Attestation2.ToScale()
+	attestation2, err := a.Attestation2.ToFastSSZ()
 	if err != nil {
-		return scale.AttesterSlashing{}, err
+		return nil, err
 	}
 
-	return scale.AttesterSlashing{
+	return &state.AttesterSlashing{
 		Attestation1: attestation1,
 		Attestation2: attestation2,
 	}, nil
 }
 
-func (a AttestationResponse) ToScale() (scale.Attestation, error) {
-	data, err := a.Data.ToScale()
+func (a AttestationResponse) ToFastSSZ() (*state.Attestation, error) {
+	data, err := a.Data.ToFastSSZ()
 	if err != nil {
-		return scale.Attestation{}, err
+		return nil, err
 	}
 
 	aggregationBits, err := util.HexStringToByteArray(a.AggregationBits)
 	if err != nil {
-		return scale.Attestation{}, err
+		return nil, err
 	}
 
-	signature, err := util.HexStringToByteArray(a.Signature)
+	signature, err := util.HexStringTo96Bytes(a.Signature)
 	if err != nil {
-		return scale.Attestation{}, err
+		return nil, err
 	}
 
-	return scale.Attestation{
+	return &state.Attestation{
 		AggregationBits: aggregationBits,
 		Data:            data,
 		Signature:       signature,
 	}, nil
 }
 
-func (d VoluntaryExitResponse) ToScale() (scale.VoluntaryExit, error) {
-	epoch, err := util.ToUint64(d.Epoch)
+func (d SignedVoluntaryExitResponse) ToFastSSZ() (*state.SignedVoluntaryExit, error) {
+	epoch, err := util.ToUint64(d.Message.Epoch)
 	if err != nil {
-		return scale.VoluntaryExit{}, err
+		return nil, err
 	}
 
-	validaterIndex, err := util.ToUint64(d.ValidatorIndex)
+	validaterIndex, err := util.ToUint64(d.Message.ValidatorIndex)
 	if err != nil {
-		return scale.VoluntaryExit{}, err
+		return nil, err
 	}
 
-	return scale.VoluntaryExit{
-		Epoch:          types.NewU64(epoch),
-		ValidaterIndex: types.NewU64(validaterIndex),
+	signature, err := util.HexStringTo96Bytes(d.Signature)
+	if err != nil {
+		return nil, err
+	}
+
+	return &state.SignedVoluntaryExit{
+		Exit: &state.VoluntaryExit{
+			Epoch:          epoch,
+			ValidatorIndex: validaterIndex,
+		},
+		Signature: signature,
 	}, nil
 }
 
-func (d DepositResponse) ToScale() (scale.Deposit, error) {
-	proofs := []types.H256{}
-
+func (d DepositResponse) ToFastSSZ() (*state.Deposit, error) {
+	proofs := [][]byte{}
 	for _, proofData := range d.Proof {
-		proofs = append(proofs, types.NewH256(common.HexToHash(proofData).Bytes()))
+		proofs = append(proofs, common.HexToHash(proofData).Bytes())
 	}
 
 	amount, err := util.ToUint64(d.Data.Amount)
 	if err != nil {
-		return scale.Deposit{}, err
+		return nil, err
 	}
 
-	pubkey, err := util.HexStringToByteArray(d.Data.Pubkey)
+	pubkey, err := util.HexStringToPublicKey(d.Data.Pubkey)
 	if err != nil {
-		return scale.Deposit{}, err
+		return nil, err
 	}
 
 	signature, err := util.HexStringToByteArray(d.Data.Signature)
 	if err != nil {
-		return scale.Deposit{}, err
+		return nil, err
 	}
 
-	return scale.Deposit{
+	withdrawalCredentials, err := util.HexStringTo32Bytes(d.Data.WithdrawalCredentials)
+	if err != nil {
+		return nil, err
+	}
+
+	return &state.Deposit{
 		Proof: proofs,
-		Data: scale.DepositData{
+		Data: &state.DepositData{
 			Pubkey:                pubkey,
-			WithdrawalCredentials: types.NewH256(common.HexToHash(d.Data.WithdrawalCredentials).Bytes()),
-			Amount:                types.NewU64(amount),
+			WithdrawalCredentials: withdrawalCredentials,
+			Amount:                amount,
 			Signature:             signature,
 		},
 	}, nil
 }
 
-func (s SignedHeaderResponse) ToScale() (scale.SignedHeader, error) {
-	message, err := s.Message.ToScale()
+func (s SignedHeaderResponse) ToFastSSZ() (*state.SignedBeaconBlockHeader, error) {
+	message, err := s.Message.ToFastSSZ()
 	if err != nil {
-		return scale.SignedHeader{}, err
+		return nil, err
+	}
+	signature, err := util.HexStringToByteArray(s.Signature)
+	if err != nil {
+		return nil, err
 	}
 
-	return scale.SignedHeader{
-		Message:   message,
-		Signature: s.Signature,
+	return &state.SignedBeaconBlockHeader{
+		Header:    message,
+		Signature: signature,
 	}, nil
 }
 
-func (i IndexedAttestationResponse) ToScale() (scale.IndexedAttestation, error) {
-	data, err := i.Data.ToScale()
+func (i IndexedAttestationResponse) ToFastSSZ() (*state.IndexedAttestation, error) {
+	data, err := i.Data.ToFastSSZ()
 	if err != nil {
-		return scale.IndexedAttestation{}, err
+		return nil, err
 	}
 
-	attestationIndexes := []types.U64{}
-
+	attestationIndexes := []uint64{}
 	for _, index := range i.AttestingIndices {
 		indexInt, err := util.ToUint64(index)
 		if err != nil {
-			return scale.IndexedAttestation{}, err
+			return nil, err
 		}
 
-		attestationIndexes = append(attestationIndexes, types.NewU64(indexInt))
+		attestationIndexes = append(attestationIndexes, indexInt)
 	}
 
 	signature, err := util.HexStringToByteArray(i.Signature)
 	if err != nil {
-		return scale.IndexedAttestation{}, err
+		return nil, err
 	}
 
-	return scale.IndexedAttestation{
-		AttestingIndices: attestationIndexes,
-		Data:             data,
-		Signature:        signature,
+	return &state.IndexedAttestation{
+		AttestationIndices: attestationIndexes,
+		Data:               data,
+		Signature:          signature,
 	}, nil
 }
 
-func (a AttestationDataResponse) ToScale() (scale.AttestationData, error) {
+func (a AttestationDataResponse) ToFastSSZ() (*state.AttestationData, error) {
 	slot, err := util.ToUint64(a.Slot)
 	if err != nil {
-		return scale.AttestationData{}, err
+		return nil, err
 	}
 
 	index, err := util.ToUint64(a.Index)
 	if err != nil {
-		return scale.AttestationData{}, err
+		return nil, err
 	}
 
-	source, err := a.Source.ToScale()
+	source, err := a.Source.ToFastSSZ()
 	if err != nil {
-		return scale.AttestationData{}, err
+		return nil, err
 	}
 
-	target, err := a.Target.ToScale()
+	target, err := a.Target.ToFastSSZ()
 	if err != nil {
-		return scale.AttestationData{}, err
+		return nil, err
 	}
 
-	return scale.AttestationData{
-		Slot:            types.NewU64(slot),
-		Index:           types.NewU64(index),
-		BeaconBlockRoot: types.NewH256(common.HexToHash(a.BeaconBlockRoot).Bytes()),
+	hash, err := util.HexStringTo32Bytes(a.BeaconBlockRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	return &state.AttestationData{
+		Slot:            state.Slot(slot),
+		Index:           index,
+		BeaconBlockHash: hash,
 		Source:          source,
 		Target:          target,
 	}, nil
@@ -705,24 +992,99 @@ func (c CheckpointResponse) ToScale() (scale.Checkpoint, error) {
 	}, nil
 }
 
-func getTransactionsHashTreeRoot(transactions []string) (types.H256, error) {
-	resultTransactions := [][]byte{}
-
-	for _, trans := range transactions {
-		decodeString, err := hex.DecodeString(strings.ReplaceAll(trans, "0x", ""))
-		if err != nil {
-			return types.H256{}, err
-		}
-		resultTransactions = append(resultTransactions, decodeString)
+func (c CheckpointResponse) ToFastSSZ() (*state.Checkpoint, error) {
+	epoch, err := util.ToUint64(c.Epoch)
+	if err != nil {
+		return nil, err
 	}
 
+	return &state.Checkpoint{
+		Epoch: epoch,
+		Root:  common.HexToHash(c.Root).Bytes(),
+	}, nil
+}
+
+func CapellaExecutionPayloadToScale(e *state.ExecutionPayloadCapella) (scale.ExecutionPayloadHeaderCapella, error) {
 	transactionsContainer := state.TransactionsRootContainer{}
-	transactionsContainer.Transactions = resultTransactions
+	transactionsContainer.Transactions = e.Transactions
 
 	transactionsRoot, err := transactionsContainer.HashTreeRoot()
 	if err != nil {
-		return types.H256{}, err
+		return scale.ExecutionPayloadHeaderCapella{}, err
 	}
 
-	return types.NewH256(transactionsRoot[:]), nil
+	var withdrawalRoot types.H256
+
+	withdrawalContainer := state.WithdrawalsRootContainerMainnet{}
+	withdrawalContainer.Withdrawals = e.Withdrawals
+	withdrawalRoot, err = withdrawalContainer.HashTreeRoot()
+
+	if err != nil {
+		return scale.ExecutionPayloadHeaderCapella{}, err
+	}
+
+	baseFeePerGas := big.Int{}
+	// Change BaseFeePerGas back from little-endian to big-endian
+	baseFeePerGas.SetBytes(util.ChangeByteOrder(e.BaseFeePerGas[:]))
+
+	return scale.ExecutionPayloadHeaderCapella{
+		ParentHash:       types.NewH256(e.ParentHash[:]),
+		FeeRecipient:     e.FeeRecipient,
+		StateRoot:        types.NewH256(e.StateRoot[:]),
+		ReceiptsRoot:     types.NewH256(e.ReceiptsRoot[:]),
+		LogsBloom:        e.LogsBloom[:],
+		PrevRandao:       types.NewH256(e.PrevRandao[:]),
+		BlockNumber:      types.NewU64(e.BlockNumber),
+		GasLimit:         types.NewU64(e.GasLimit),
+		GasUsed:          types.NewU64(e.GasUsed),
+		Timestamp:        types.NewU64(e.Timestamp),
+		ExtraData:        e.ExtraData,
+		BaseFeePerGas:    types.NewU256(baseFeePerGas),
+		BlockHash:        types.NewH256(e.BlockHash[:]),
+		TransactionsRoot: transactionsRoot,
+		WithdrawalsRoot:  withdrawalRoot,
+	}, nil
+}
+
+func CapellaJsonExecutionPayloadHeaderToScale(e *beaconjson.FullExecutionPayloadHeaderJson) (scale.ExecutionPayloadHeaderCapella, error) {
+	var executionPayloadHeader scale.ExecutionPayloadHeaderCapella
+	var baseFeePerGas big.Int
+	baseFeePerGasU64, err := util.ToUint64(e.BaseFeePerGas)
+	if err != nil {
+		return executionPayloadHeader, err
+	}
+	blockNumber, err := util.ToUint64(e.BlockNumber)
+	if err != nil {
+		return executionPayloadHeader, err
+	}
+	baseFeePerGas.SetUint64(baseFeePerGasU64)
+	gasLimit, err := util.ToUint64(e.GasLimit)
+	if err != nil {
+		return executionPayloadHeader, err
+	}
+	gasUsed, err := util.ToUint64(e.GasUsed)
+	if err != nil {
+		return executionPayloadHeader, err
+	}
+	timestamp, err := util.ToUint64(e.Timestamp)
+	if err != nil {
+		return executionPayloadHeader, err
+	}
+	return scale.ExecutionPayloadHeaderCapella{
+		ParentHash:       types.NewH256(common.HexToHash(e.ParentHash).Bytes()),
+		FeeRecipient:     types.NewH160(common.HexToAddress(e.FeeRecipient).Bytes()),
+		StateRoot:        types.NewH256(common.HexToHash(e.StateRoot).Bytes()),
+		ReceiptsRoot:     types.NewH256(common.HexToHash(e.ReceiptsRoot).Bytes()),
+		LogsBloom:        common.Hex2Bytes(e.LogsBloom),
+		PrevRandao:       types.NewH256(common.HexToHash(e.PrevRandao).Bytes()),
+		BlockNumber:      types.NewU64(blockNumber),
+		GasLimit:         types.NewU64(gasLimit),
+		GasUsed:          types.NewU64(gasUsed),
+		Timestamp:        types.NewU64(timestamp),
+		ExtraData:        common.Hex2Bytes(e.ExtraData),
+		BaseFeePerGas:    types.NewU256(baseFeePerGas),
+		BlockHash:        types.NewH256(common.HexToHash(e.ParentHash).Bytes()),
+		TransactionsRoot: types.NewH256(common.HexToHash(e.TransactionsRoot).Bytes()),
+		WithdrawalsRoot:  types.NewH256(common.HexToHash(e.WithdrawalsRoot).Bytes()),
+	}, nil
 }

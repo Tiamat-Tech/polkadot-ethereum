@@ -2,17 +2,22 @@ package cmd
 
 import (
 	"fmt"
-	"github.com/snowfork/snowbridge/relayer/relays/beacon/cache"
-	"github.com/snowfork/snowbridge/relayer/relays/beacon/config"
 	"io/ioutil"
 	"strings"
 
-	"github.com/ethereum/go-ethereum/common"
-	log "github.com/sirupsen/logrus"
 	"github.com/snowfork/snowbridge/relayer/chain/parachain"
 	"github.com/snowfork/snowbridge/relayer/crypto/sr25519"
+	"github.com/snowfork/snowbridge/relayer/relays/beacon/cache"
+	"github.com/snowfork/snowbridge/relayer/relays/beacon/config"
 	"github.com/snowfork/snowbridge/relayer/relays/beacon/header/syncer"
+	"github.com/snowfork/snowbridge/relayer/relays/beacon/header/syncer/api"
+	"github.com/snowfork/snowbridge/relayer/relays/beacon/protocol"
+	"github.com/snowfork/snowbridge/relayer/relays/beacon/store"
+
+	"github.com/ethereum/go-ethereum/common"
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -74,7 +79,16 @@ func importExecutionHeaderFn(cmd *cobra.Command, _ []string) error {
 		lodestarEndpoint, _ := cmd.Flags().GetString("lodestar-endpoint")
 		beaconHeader, _ := cmd.Flags().GetString("beacon-header")
 		finalizedHeader, _ := cmd.Flags().GetString("finalized-header")
-		network, _ := cmd.Flags().GetString("network")
+
+		viper.SetConfigFile("web/packages/test/config/beacon-relay.json")
+		if err := viper.ReadInConfig(); err != nil {
+			return err
+		}
+		var conf config.Config
+		err := viper.Unmarshal(&conf)
+		if err != nil {
+			return err
+		}
 
 		keypair, err := getKeyPair(privateKeyFile)
 		if err != nil {
@@ -87,7 +101,7 @@ func importExecutionHeaderFn(cmd *cobra.Command, _ []string) error {
 			return fmt.Errorf("connect to parachain: %w", err)
 		}
 
-		writer := parachain.NewParachainWriter(paraconn, 32)
+		writer := parachain.NewParachainWriter(paraconn, 8)
 		err = writer.Start(ctx, eg)
 		if err != nil {
 			return fmt.Errorf("start parachain conn: %w", err)
@@ -95,7 +109,13 @@ func importExecutionHeaderFn(cmd *cobra.Command, _ []string) error {
 
 		log.WithField("hash", beaconHeader).Info("will be syncing execution header for beacon hash")
 
-		syncer := syncer.New(lodestarEndpoint, 32, 256, 8192, config.ActiveSpec(network))
+		p := protocol.New(conf.Source.Beacon.Spec, conf.Sink.Parachain.HeaderRedundancy)
+		store := store.New(conf.Source.Beacon.DataStore.Location, conf.Source.Beacon.DataStore.MaxEntries, *p)
+		store.Connect()
+		defer store.Close()
+
+		client := api.NewBeaconClient(lodestarEndpoint, lodestarEndpoint)
+		syncer := syncer.New(client, &store, p)
 
 		beaconHeaderHash := common.HexToHash(finalizedHeader)
 
@@ -113,20 +133,11 @@ func importExecutionHeaderFn(cmd *cobra.Command, _ []string) error {
 			Slot:               uint64(finalizedUpdate.Payload.FinalizedHeader.Slot),
 		}
 
-		update, err := syncer.GetHeaderUpdateWithAncestryProof(beaconHeaderHash, checkpoint)
+		update, err := syncer.GetHeaderUpdate(beaconHeaderHash, &checkpoint)
 		if err != nil {
 			return fmt.Errorf("get header update: %w", err)
 		}
-		log.WithField("slot", update.Block.Slot).Info("found block at slot")
-
-		syncAggregate, signatureSlot, err := syncer.GetSyncAggregateForSlot(uint64(update.Block.Slot) + 1)
-		if err != nil {
-			return fmt.Errorf("get sync aggregate: %w", err)
-		}
-		log.Info("found sync aggregate")
-
-		update.SyncAggregate = syncAggregate
-		update.SignatureSlot = signatureSlot
+		log.WithField("slot", update.Header.Slot).Info("found block at slot")
 
 		err = writer.WriteToParachainAndWatch(ctx, "EthereumBeaconClient.import_execution_header", update)
 		if err != nil {

@@ -5,20 +5,15 @@ package ethereum
 
 import (
 	"bytes"
-	"encoding/hex"
 
 	etypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
 	etrie "github.com/ethereum/go-ethereum/trie"
-	"github.com/sirupsen/logrus"
 	"github.com/snowfork/go-substrate-rpc-client/v4/types"
-	"github.com/snowfork/snowbridge/relayer/chain"
 	"github.com/snowfork/snowbridge/relayer/chain/parachain"
-
-	log "github.com/sirupsen/logrus"
 )
 
-func MakeMessageFromEvent(event *etypes.Log, receiptsTrie *etrie.Trie) (*chain.EthereumOutboundMessage, error) {
+func MakeMessageFromEvent(event *etypes.Log, receiptsTrie *etrie.Trie) (*parachain.Message, error) {
 	// RLP encode event log's Address, Topics, and Data
 	var buf bytes.Buffer
 	err := event.EncodeRLP(&buf)
@@ -32,34 +27,26 @@ func MakeMessageFromEvent(event *etypes.Log, receiptsTrie *etrie.Trie) (*chain.E
 	}
 
 	proof := parachain.NewProofData()
-	err = receiptsTrie.Prove(receiptKey, 0, proof)
+	err = receiptsTrie.Prove(receiptKey, proof)
 	if err != nil {
 		return nil, err
 	}
 
+	var convertedTopics []types.H256
+	for _, topic := range event.Topics {
+		convertedTopics = append(convertedTopics, types.H256(topic))
+	}
+
 	m := parachain.Message{
-		Data: buf.Bytes(),
+		EventLog: parachain.EventLog{
+			Address: types.H160(event.Address),
+			Topics:  convertedTopics,
+			Data:    event.Data,
+		},
 		Proof: parachain.Proof{
-			BlockHash: types.NewH256(event.BlockHash.Bytes()),
-			TxIndex:   types.NewU32(uint32(event.TxIndex)),
-			Data:      proof,
+			ReceiptProof: proof,
 		},
 	}
 
-	value := hex.EncodeToString(m.Data)
-	log.WithFields(logrus.Fields{
-		"payload":    value,
-		"blockHash":  m.Proof.BlockHash.Hex(),
-		"eventIndex": m.Proof.TxIndex,
-	}).Debug("Generated message from Ethereum log")
-
-	var args []interface{}
-	args = append(args, m)
-
-	message := chain.EthereumOutboundMessage{
-		Call: "BasicInboundChannel.submit",
-		Args: args,
-	}
-
-	return &message, nil
+	return &m, nil
 }

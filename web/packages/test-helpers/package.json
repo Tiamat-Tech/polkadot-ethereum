@@ -1,0 +1,48 @@
+{
+  "name": "@snowbridge/test-helpers",
+  "version": "1.0.0",
+  "description": "Snowbridge test helpers",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Snowfork/snowbridge.git",
+    "directory": "web/packages/test-helpers"
+  },
+  "scripts": {
+    "build": "tsc",
+    "lint": "eslint src/*",
+    "generateBeefyCheckpoint": "npx ts-node src/generateBeefyCheckpoint.ts",
+    "generateContracts": "npx ts-node src/generateContractInfo.ts",
+    "generateBeefyValidatorSet": "npx ts-node src/generateBeefyTestFixture.ts GenerateInitialSet",
+    "generateBeefyFinalProof": "npx ts-node src/generateBeefyTestFixture.ts GenerateProofs",
+    "format": "prettier src --write"
+  },
+  "devDependencies": {
+    "@types/node": "^18.16.8",
+    "@typescript-eslint/eslint-plugin": "^5.42.0",
+    "@typescript-eslint/parser": "^5.42.0",
+    "eslint": "^8.26.0",
+    "eslint-config-prettier": "^8.5.0",
+    "ts-node": "^10.9.1",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.1.6"
+  },
+  "dependencies": {
+    "@polkadot/api": "^14.3.1",
+    "@polkadot/types": "^14.3.1",
+    "@polkadot/types-codec": "^14.3.1",
+    "@snowbridge/contract-types": "workspace:*",
+    "@typechain/ethers-v6": "^0.5.1",
+    "@types/keccak": "^3.0.1",
+    "@types/lodash": "^4.14.186",
+    "@types/secp256k1": "^4.0.3",
+    "@types/seedrandom": "^3.0.2",
+    "bitfield": "^4.1.0",
+    "ethers": "^6.13.5",
+    "keccak": "^3.0.2",
+    "lodash": "^4.17.21",
+    "merkletreejs": "^0.4.1",
+    "secp256k1": "^4.0.2",
+    "seedrandom": "^3.0.5"
+  }
+}

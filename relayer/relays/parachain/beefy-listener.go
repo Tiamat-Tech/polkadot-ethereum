@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -14,18 +15,21 @@ import (
 	"github.com/snowfork/snowbridge/relayer/chain/ethereum"
 	"github.com/snowfork/snowbridge/relayer/chain/parachain"
 	"github.com/snowfork/snowbridge/relayer/chain/relaychain"
-	"github.com/snowfork/snowbridge/relayer/contracts/beefyclient"
+	"github.com/snowfork/snowbridge/relayer/contracts"
 	"github.com/snowfork/snowbridge/relayer/crypto/merkle"
+	"github.com/snowfork/snowbridge/relayer/ofac"
 
 	log "github.com/sirupsen/logrus"
 )
 
 type BeefyListener struct {
 	config              *SourceConfig
+	scheduleConfig      *ScheduleConfig
 	ethereumConn        *ethereum.Connection
-	beefyClientContract *beefyclient.BeefyClient
+	beefyClientContract *contracts.BeefyClient
 	relaychainConn      *relaychain.Connection
 	parachainConnection *parachain.Connection
+	ofac                *ofac.OFAC
 	paraID              uint32
 	tasks               chan<- *Task
 	scanner             *Scanner
@@ -33,29 +37,28 @@ type BeefyListener struct {
 
 func NewBeefyListener(
 	config *SourceConfig,
+	scheduleConfig *ScheduleConfig,
 	ethereumConn *ethereum.Connection,
 	relaychainConn *relaychain.Connection,
 	parachainConnection *parachain.Connection,
+	ofac *ofac.OFAC,
 	tasks chan<- *Task,
 ) *BeefyListener {
 	return &BeefyListener{
 		config:              config,
+		scheduleConfig:      scheduleConfig,
 		ethereumConn:        ethereumConn,
 		relaychainConn:      relaychainConn,
 		parachainConnection: parachainConnection,
+		ofac:                ofac,
 		tasks:               tasks,
 	}
 }
 
 func (li *BeefyListener) Start(ctx context.Context, eg *errgroup.Group) error {
-	sourceIDs, err := li.config.getSourceIDs()
-	if err != nil {
-		return err
-	}
-
 	// Set up light client bridge contract
 	address := common.HexToAddress(li.config.Contracts.BeefyClient)
-	beefyClientContract, err := beefyclient.NewBeefyClient(address, li.ethereumConn.Client())
+	beefyClientContract, err := contracts.NewBeefyClient(address, li.ethereumConn.Client())
 	if err != nil {
 		return err
 	}
@@ -74,17 +77,15 @@ func (li *BeefyListener) Start(ctx context.Context, eg *errgroup.Group) error {
 	if !ok {
 		return fmt.Errorf("parachain id missing")
 	}
-
 	li.paraID = paraID
 
 	li.scanner = &Scanner{
-		config:           li.config,
-		ethConn:          li.ethereumConn,
-		relayConn:        li.relaychainConn,
-		paraConn:         li.parachainConnection,
-		eventQueryClient: NewQueryClient(),
-		paraID:           paraID,
-		sourceIDs:        sourceIDs,
+		config:    li.config,
+		ethConn:   li.ethereumConn,
+		relayConn: li.relaychainConn,
+		paraConn:  li.parachainConnection,
+		paraID:    paraID,
+		ofac:      li.ofac,
 	}
 
 	eg.Go(func() error {
@@ -162,18 +163,12 @@ func (li *BeefyListener) doScan(ctx context.Context, beefyBlockNumber uint64) er
 	if err != nil {
 		return err
 	}
-
 	for _, task := range tasks {
-		// do final proof generation right before sending. The proof needs to be fresh.
-		task.ProofOutput, err = li.generateProof(ctx, task.ProofInput)
+		paraNonce := (*task.MessageProofs)[0].Message.Nonce
+		waitingPeriod := (paraNonce + li.scheduleConfig.TotalRelayerCount - li.scheduleConfig.ID) % li.scheduleConfig.TotalRelayerCount
+		err = li.waitAndSend(ctx, task, waitingPeriod)
 		if err != nil {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case li.tasks <- task:
-			log.Info("Beefy Listener emitted new task")
+			return fmt.Errorf("wait task for nonce %d: %w", paraNonce, err)
 		}
 	}
 
@@ -184,8 +179,8 @@ func (li *BeefyListener) doScan(ctx context.Context, beefyBlockNumber uint64) er
 func (li *BeefyListener) queryBeefyClientEvents(
 	ctx context.Context, start uint64,
 	end *uint64,
-) ([]*beefyclient.BeefyClientNewMMRRoot, error) {
-	var events []*beefyclient.BeefyClientNewMMRRoot
+) ([]*contracts.BeefyClientNewMMRRoot, error) {
+	var events []*contracts.BeefyClientNewMMRRoot
 	filterOps := bind.FilterOpts{Start: start, End: end, Context: ctx}
 
 	iter, err := li.beefyClientContract.FilterNewMMRRoot(&filterOps)
@@ -227,9 +222,13 @@ func (li *BeefyListener) fetchLatestBeefyBlock(ctx context.Context) (uint64, typ
 	return number, hash, nil
 }
 
+// The maximum paras that will be included in the proof.
+// https://github.com/paritytech/polkadot-sdk/blob/d66dee3c3da836bcf41a12ca4e1191faee0b6a5b/polkadot/runtime/parachains/src/paras/mod.rs#L1225-L1232
+const MaxParaHeads = 1024
+
 // Generates a proof for an MMR leaf, and then generates a merkle proof for our parachain header, which should be verifiable against the
 // parachains root in the mmr leaf.
-func (li *BeefyListener) generateProof(ctx context.Context, input *ProofInput) (*ProofOutput, error) {
+func (li *BeefyListener) generateProof(ctx context.Context, input *ProofInput, header *types.Header) (*ProofOutput, error) {
 	latestBeefyBlockNumber, latestBeefyBlockHash, err := li.fetchLatestBeefyBlock(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("fetch latest beefy block: %w", err)
@@ -242,9 +241,8 @@ func (li *BeefyListener) generateProof(ctx context.Context, input *ProofInput) (
 
 	// Generate the MMR proof for the polkadot block.
 	mmrProof, err := li.relaychainConn.GenerateProofForBlock(
-		input.RelayBlockNumber,
+		input.RelayBlockNumber+1,
 		latestBeefyBlockHash,
-		li.config.BeefyActivationBlock,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("generate MMR leaf proof: %w", err)
@@ -266,21 +264,10 @@ func (li *BeefyListener) generateProof(ctx context.Context, input *ProofInput) (
 		return nil, fmt.Errorf("retrieve MMR root hash at block %v: %w", latestBeefyBlockHash.Hex(), err)
 	}
 
-	// Generate a merkle proof for the parachain head with input ParaId
-	// and verify with merkle root hash of all parachain heads
-	// Polkadot uses the following code to generate merkle root from parachain headers:
-	// https://github.com/paritytech/polkadot/blob/2eb7672905d99971fc11ad7ff4d57e68967401d2/runtime/rococo/src/lib.rs#L706-L709
-	merkleProofData, err := CreateParachainMerkleProof(input.ParaHeads, input.ParaID)
+	var merkleProofData *MerkleProofData
+	merkleProofData, input.ParaHeads, err = li.generateAndValidateParasHeadsMerkleProof(input, &mmrProof)
 	if err != nil {
-		return nil, fmt.Errorf("create parachain header proof: %w", err)
-	}
-
-	// Verify merkle root generated is same as value generated in relaychain
-	if merkleProofData.Root.Hex() != mmrProof.Leaf.ParachainHeads.Hex() {
-		return nil, fmt.Errorf("MMR parachain merkle root does not match calculated parachain merkle root (mmr: %s, computed: %s)",
-			mmrProof.Leaf.ParachainHeads.Hex(),
-			merkleProofData.Root.String(),
-		)
+		return nil, err
 	}
 
 	log.Debug("Created all parachain merkle proof data")
@@ -288,8 +275,86 @@ func (li *BeefyListener) generateProof(ctx context.Context, input *ProofInput) (
 	output := ProofOutput{
 		MMRProof:        simplifiedProof,
 		MMRRootHash:     mmrRootHash,
-		MerkleProofData: merkleProofData,
+		Header:          *header,
+		MerkleProofData: *merkleProofData,
 	}
 
 	return &output, nil
+}
+
+// Generate a merkle proof for the parachain head with input ParaId and verify with merkle root hash of all parachain heads
+func (li *BeefyListener) generateAndValidateParasHeadsMerkleProof(input *ProofInput, mmrProof *types.GenerateMMRProofResponse) (*MerkleProofData, []relaychain.ParaHead, error) {
+	// Polkadot uses the following code to generate merkle root from parachain headers:
+	// https://github.com/paritytech/polkadot-sdk/blob/d66dee3c3da836bcf41a12ca4e1191faee0b6a5b/polkadot/runtime/westend/src/lib.rs#L453-L460
+	// Truncate the ParaHeads to the 1024
+	// https://github.com/paritytech/polkadot-sdk/blob/d66dee3c3da836bcf41a12ca4e1191faee0b6a5b/polkadot/runtime/parachains/src/paras/mod.rs#L1305-L1311
+	paraHeads := input.ParaHeads
+	numParas := min(MaxParaHeads, len(paraHeads))
+	merkleProofData, err := CreateParachainMerkleProof(paraHeads[:numParas], input.ParaID)
+	if err != nil {
+		return nil, paraHeads, fmt.Errorf("create parachain header proof: %w", err)
+	}
+
+	// Verify merkle root generated is same as value generated in relaychain and if so exit early
+	if merkleProofData.Root.Hex() == mmrProof.Leaf.ParachainHeads.Hex() {
+		return &merkleProofData, paraHeads, nil
+	}
+
+	// Try a filtering out parathreads
+	log.WithFields(log.Fields{
+		"computedMmr": merkleProofData.Root.Hex(),
+		"mmr":         mmrProof.Leaf.ParachainHeads.Hex(),
+	}).Warn("MMR parachain merkle root does not match calculated merkle root. Trying to filtering out parathreads.")
+
+	paraHeads, err = li.relaychainConn.FilterParachainHeads(paraHeads, input.RelayBlockHash)
+	if err != nil {
+		return nil, paraHeads, fmt.Errorf("could not filter out parathreads: %w", err)
+	}
+
+	numParas = min(MaxParaHeads, len(paraHeads))
+	merkleProofData, err = CreateParachainMerkleProof(paraHeads[:numParas], input.ParaID)
+	if err != nil {
+		return nil, paraHeads, fmt.Errorf("create parachain header proof: %w", err)
+	}
+	if merkleProofData.Root.Hex() != mmrProof.Leaf.ParachainHeads.Hex() {
+		return nil, paraHeads, fmt.Errorf("MMR parachain merkle root does not match calculated parachain merkle root (mmr: %s, computed: %s)",
+			mmrProof.Leaf.ParachainHeads.Hex(),
+			merkleProofData.Root.String(),
+		)
+	}
+	return &merkleProofData, paraHeads, nil
+}
+
+func (li *BeefyListener) waitAndSend(ctx context.Context, task *Task, waitingPeriod uint64) error {
+	paraNonce := (*task.MessageProofs)[0].Message.Nonce
+	log.Info(fmt.Sprintf("waiting for nonce %d to be picked up by another relayer", paraNonce))
+	var cnt uint64
+	var err error
+	for {
+		ethInboundNonce, err := li.scanner.findLatestNonce(ctx)
+		if err != nil {
+			return err
+		}
+		if ethInboundNonce >= paraNonce {
+			log.Info(fmt.Sprintf("nonce %d picked up by another relayer, just skip", paraNonce))
+			return nil
+		}
+		if cnt == waitingPeriod {
+			break
+		}
+		time.Sleep(time.Duration(li.scheduleConfig.SleepInterval) * time.Second)
+		cnt++
+	}
+	log.Info(fmt.Sprintf("nonce %d is not picked up by any one, submit anyway", paraNonce))
+	task.ProofOutput, err = li.generateProof(ctx, task.ProofInput, task.Header)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case li.tasks <- task:
+		log.Info("Beefy Listener emitted new task")
+	}
+	return nil
 }

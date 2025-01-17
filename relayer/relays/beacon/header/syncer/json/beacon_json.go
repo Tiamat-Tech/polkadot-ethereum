@@ -4,12 +4,13 @@ import (
 	"strings"
 )
 
-type InitialSync struct {
+type CheckPoint struct {
 	Header                     BeaconHeader  `json:"header"`
 	CurrentSyncCommittee       SyncCommittee `json:"current_sync_committee"`
 	CurrentSyncCommitteeBranch []string      `json:"current_sync_committee_branch"`
 	ValidatorsRoot             string        `json:"validators_root"`
-	ImportTime                 uint64        `json:"import_time"`
+	BlockRootsRoot             string        `json:"block_roots_root"`
+	BlockRootsBranch           []string      `json:"block_roots_branch"`
 }
 
 type BeaconHeader struct {
@@ -30,27 +31,22 @@ type SyncAggregate struct {
 	SyncCommitteeSignature string `json:"sync_committee_signature"`
 }
 
-type SyncCommitteeUpdate struct {
-	AttestedHeader          BeaconHeader  `json:"attested_header"`
-	NextSyncCommittee       SyncCommittee `json:"next_sync_committee"`
-	NextSyncCommitteeBranch []string      `json:"next_sync_committee_branch"`
-	FinalizedHeader         BeaconHeader  `json:"finalized_header"`
-	FinalityBranch          []string      `json:"finality_branch"`
-	SyncAggregate           SyncAggregate `json:"sync_aggregate"`
-	SyncCommitteePeriod     uint64        `json:"sync_committee_period"`
-	SignatureSlot           uint64        `json:"signature_slot"`
-	BlockRootsHash          string        `json:"block_roots_hash"`
-	BlockRootProof          []string      `json:"block_roots_proof"`
+type Update struct {
+	AttestedHeader          BeaconHeader                     `json:"attested_header"`
+	SyncAggregate           SyncAggregate                    `json:"sync_aggregate"`
+	SignatureSlot           uint64                           `json:"signature_slot"`
+	NextSyncCommitteeUpdate *NextSyncCommitteeUpdate         `json:"next_sync_committee_update"`
+	FinalizedHeader         BeaconHeader                     `json:"finalized_header"`
+	FinalityBranch          []string                         `json:"finality_branch"`
+	BlockRootsRoot          string                           `json:"block_roots_root"`
+	BlockRootsBranch        []string                         `json:"block_roots_branch"`
+	ExecutionHeader         *VersionedExecutionPayloadHeader `json:"execution_header"`
+	ExecutionBranch         *[]string                        `json:"execution_branch"`
 }
 
-type FinalizedHeaderUpdate struct {
-	AttestedHeader  BeaconHeader  `json:"attested_header"`
-	FinalizedHeader BeaconHeader  `json:"finalized_header"`
-	FinalityBranch  []string      `json:"finality_branch"`
-	SyncAggregate   SyncAggregate `json:"sync_aggregate"`
-	SignatureSlot   uint64        `json:"signature_slot"`
-	BlockRootsHash  string        `json:"block_roots_hash"`
-	BlockRootProof  []string      `json:"block_roots_proof"`
+type NextSyncCommitteeUpdate struct {
+	NextSyncCommittee       SyncCommittee `json:"next_sync_committee"`
+	NextSyncCommitteeBranch []string      `json:"next_sync_committee_branch"`
 }
 
 type ProposerSlashing struct {
@@ -87,29 +83,29 @@ type SignedHeader struct {
 	Signature string       `json:"signature"`
 }
 
-type Block struct {
-	Slot          uint64    `json:"slot"`
-	ProposerIndex uint64    `json:"proposer_index"`
-	ParentRoot    string    `json:"parent_root"`
-	StateRoot     string    `json:"state_root"`
-	Body          BlockBody `json:"body"`
+type ExecutionPayloadHeaderCapella struct {
+	ParentHash       string `json:"parent_hash"`
+	FeeRecipient     string `json:"fee_recipient"`
+	StateRoot        string `json:"state_root"`
+	ReceiptsRoot     string `json:"receipts_root"`
+	LogsBloom        string `json:"logs_bloom"`
+	PrevRandao       string `json:"prev_randao"`
+	BlockNumber      uint64 `json:"block_number"`
+	GasLimit         uint64 `json:"gas_limit"`
+	GasUsed          uint64 `json:"gas_used"`
+	Timestamp        uint64 `json:"timestamp"`
+	ExtraData        string `json:"extra_data"`
+	BaseFeePerGas    uint64 `json:"base_fee_per_gas"`
+	BlockHash        string `json:"block_hash"`
+	TransactionsRoot string `json:"transactions_root"`
+	WithdrawalsRoot  string `json:"withdrawals_root"`
 }
 
-type ExecutionPayload struct {
-	ParentHash      string `json:"parent_hash"`
-	FeeRecipient    string `json:"fee_recipient"`
-	StateRoot       string `json:"state_root"`
-	ReceiptsRoot    string `json:"receipts_root"`
-	LogsBloom       string `json:"logs_bloom"`
-	PrevRandao      string `json:"prev_randao"`
-	BlockNumber     uint64 `json:"block_number"`
-	GasLimit        uint64 `json:"gas_limit"`
-	GasUsed         uint64 `json:"gas_used"`
-	Timestamp       uint64 `json:"timestamp"`
-	ExtraData       string `json:"extra_data"`
-	BaseFeePerGas   uint64 `json:"base_fee_per_gas"`
-	BlockHash       string `json:"block_hash"`
-	TransactionRoot string `json:"transactions_root"`
+type CompactExecutionHeader struct {
+	ParentHash   string `json:"parent_hash"`
+	StateRoot    string `json:"state_root"`
+	ReceiptsRoot string `json:"receipts_root"`
+	BlockNumber  uint64 `json:"block_number"`
 }
 
 type Eth1Data struct {
@@ -119,24 +115,28 @@ type Eth1Data struct {
 }
 
 type BlockBody struct {
-	RandaoReveal      string             `json:"randao_reveal"`
-	Eth1Data          Eth1Data           `json:"eth1_data"`
-	Graffiti          string             `json:"graffiti"`
-	ProposerSlashings []ProposerSlashing `json:"proposer_slashings"`
-	AttesterSlashings []AttesterSlashing `json:"attester_slashings"`
-	Attestations      []Attestation      `json:"attestations"`
-	Deposits          []Deposit          `json:"deposits"`
-	VoluntaryExits    []VoluntaryExit    `json:"voluntary_exits"`
-	SyncAggregate     SyncAggregate      `json:"sync_aggregate"`
-	ExecutionPayload  ExecutionPayload   `json:"execution_payload"`
+	RandaoReveal      string                        `json:"randao_reveal"`
+	Eth1Data          Eth1Data                      `json:"eth1_data"`
+	Graffiti          string                        `json:"graffiti"`
+	ProposerSlashings []ProposerSlashing            `json:"proposer_slashings"`
+	AttesterSlashings []AttesterSlashing            `json:"attester_slashings"`
+	Attestations      []Attestation                 `json:"attestations"`
+	Deposits          []Deposit                     `json:"deposits"`
+	VoluntaryExits    []VoluntaryExit               `json:"voluntary_exits"`
+	SyncAggregate     SyncAggregate                 `json:"sync_aggregate"`
+	ExecutionPayload  ExecutionPayloadHeaderCapella `json:"execution_payload"`
 }
 
 type HeaderUpdate struct {
-	Block                         Block         `json:"block"`
-	SyncAggregate                 SyncAggregate `json:"sync_aggregate"`
-	SignatureSlot                 uint64        `json:"signature_slot"`
-	BlockRootProof                []string      `json:"block_root_proof"`
-	BlockRootProofFinalizedHeader string        `json:"block_root_proof_finalized_header"`
+	Header          BeaconHeader                    `json:"header"`
+	AncestryProof   *AncestryProof                  `json:"ancestry_proof"`
+	ExecutionHeader VersionedExecutionPayloadHeader `json:"execution_header"`
+	ExecutionBranch []string                        `json:"execution_branch"`
+}
+
+type AncestryProof struct {
+	HeaderBranch       []string `json:"header_branch"`
+	FinalizedBlockRoot string   `json:"finalized_block_root"`
 }
 
 type Attestation struct {
@@ -160,6 +160,12 @@ type VoluntaryExit struct {
 type Deposit struct {
 	Proof []string    `json:"proof"`
 	Data  DepositData `json:"data"`
+}
+
+func (c *CompactExecutionHeader) RemoveLeadingZeroHashes() {
+	c.ParentHash = removeLeadingZeroHash(c.ParentHash)
+	c.ReceiptsRoot = removeLeadingZeroHash(c.ReceiptsRoot)
+	c.StateRoot = removeLeadingZeroHash(c.StateRoot)
 }
 
 func (b *BeaconHeader) RemoveLeadingZeroHashes() {
@@ -223,35 +229,7 @@ func (d *Deposit) RemoveLeadingZeroHashes() {
 	d.Data.WithdrawalCredentials = removeLeadingZeroHash(d.Data.WithdrawalCredentials)
 }
 
-func (b *Block) RemoveLeadingZeroHashes() {
-	b.ParentRoot = removeLeadingZeroHash(b.ParentRoot)
-	b.StateRoot = removeLeadingZeroHash(b.StateRoot)
-	b.Body.RandaoReveal = removeLeadingZeroHash(b.Body.RandaoReveal)
-	b.Body.Eth1Data.DepositRoot = removeLeadingZeroHash(b.Body.Eth1Data.DepositRoot)
-	b.Body.Eth1Data.BlockHash = removeLeadingZeroHash(b.Body.Eth1Data.BlockHash)
-	b.Body.Graffiti = removeLeadingZeroHash(b.Body.Graffiti)
-
-	for i := range b.Body.ProposerSlashings {
-		b.Body.ProposerSlashings[i].RemoveLeadingZeroHashes()
-	}
-
-	for i := range b.Body.AttesterSlashings {
-		b.Body.AttesterSlashings[i].RemoveLeadingZeroHashes()
-	}
-
-	for i := range b.Body.Attestations {
-		b.Body.Attestations[i].RemoveLeadingZeroHashes()
-	}
-
-	for i := range b.Body.Deposits {
-		b.Body.Deposits[i].RemoveLeadingZeroHashes()
-	}
-
-	b.Body.SyncAggregate.RemoveLeadingZeroHashes()
-	b.Body.ExecutionPayload.RemoveLeadingZeroHashes()
-}
-
-func (e *ExecutionPayload) RemoveLeadingZeroHashes() {
+func (e *ExecutionPayloadHeaderCapella) RemoveLeadingZeroHashes() {
 	e.ParentHash = removeLeadingZeroHash(e.ParentHash)
 	e.FeeRecipient = removeLeadingZeroHash(e.FeeRecipient)
 	e.StateRoot = removeLeadingZeroHash(e.StateRoot)
@@ -260,10 +238,11 @@ func (e *ExecutionPayload) RemoveLeadingZeroHashes() {
 	e.PrevRandao = removeLeadingZeroHash(e.PrevRandao)
 	e.ExtraData = removeLeadingZeroHash(e.ExtraData)
 	e.BlockHash = removeLeadingZeroHash(e.BlockHash)
-	e.TransactionRoot = removeLeadingZeroHash(e.TransactionRoot)
+	e.TransactionsRoot = removeLeadingZeroHash(e.TransactionsRoot)
+	e.WithdrawalsRoot = removeLeadingZeroHash(e.WithdrawalsRoot)
 }
 
-func (i *InitialSync) RemoveLeadingZeroHashes() {
+func (i *CheckPoint) RemoveLeadingZeroHashes() {
 	i.Header.RemoveLeadingZeroHashes()
 	i.CurrentSyncCommittee.RemoveLeadingZeroHashes()
 
@@ -272,33 +251,32 @@ func (i *InitialSync) RemoveLeadingZeroHashes() {
 	}
 
 	i.ValidatorsRoot = removeLeadingZeroHash(i.ValidatorsRoot)
+	i.BlockRootsRoot = removeLeadingZeroHash(i.BlockRootsRoot)
+	i.BlockRootsBranch = removeLeadingZeroHashForSlice(i.BlockRootsBranch)
 }
 
-func (s *SyncCommitteeUpdate) RemoveLeadingZeroHashes() {
+func (s *Update) RemoveLeadingZeroHashes() {
 	s.AttestedHeader.RemoveLeadingZeroHashes()
-	s.NextSyncCommittee.RemoveLeadingZeroHashes()
-	s.NextSyncCommitteeBranch = removeLeadingZeroHashForSlice(s.NextSyncCommitteeBranch)
+	s.SyncAggregate.RemoveLeadingZeroHashes()
+	if s.NextSyncCommitteeUpdate != nil {
+		s.NextSyncCommitteeUpdate.NextSyncCommittee.RemoveLeadingZeroHashes()
+		s.NextSyncCommitteeUpdate.NextSyncCommitteeBranch = removeLeadingZeroHashForSlice(s.NextSyncCommitteeUpdate.NextSyncCommitteeBranch)
+	}
 	s.FinalizedHeader.RemoveLeadingZeroHashes()
 	s.FinalityBranch = removeLeadingZeroHashForSlice(s.FinalityBranch)
-	s.SyncAggregate.RemoveLeadingZeroHashes()
-	s.BlockRootsHash = removeLeadingZeroHash(s.BlockRootsHash)
-	s.BlockRootProof = removeLeadingZeroHashForSlice(s.BlockRootProof)
-}
+	s.BlockRootsRoot = removeLeadingZeroHash(s.BlockRootsRoot)
+	s.BlockRootsBranch = removeLeadingZeroHashForSlice(s.BlockRootsBranch)
 
-func (f *FinalizedHeaderUpdate) RemoveLeadingZeroHashes() {
-	f.AttestedHeader.RemoveLeadingZeroHashes()
-	f.FinalizedHeader.RemoveLeadingZeroHashes()
-	f.FinalityBranch = removeLeadingZeroHashForSlice(f.FinalityBranch)
-	f.SyncAggregate.RemoveLeadingZeroHashes()
-	f.BlockRootsHash = removeLeadingZeroHash(f.BlockRootsHash)
-	f.BlockRootProof = removeLeadingZeroHashForSlice(f.BlockRootProof)
 }
 
 func (h *HeaderUpdate) RemoveLeadingZeroHashes() {
-	h.Block.RemoveLeadingZeroHashes()
-	h.SyncAggregate.RemoveLeadingZeroHashes()
-	h.BlockRootProof = removeLeadingZeroHashForSlice(h.BlockRootProof)
-	h.BlockRootProofFinalizedHeader = removeLeadingZeroHash(h.BlockRootProofFinalizedHeader)
+	h.Header.RemoveLeadingZeroHashes()
+	if h.AncestryProof != nil {
+		h.AncestryProof.HeaderBranch = removeLeadingZeroHashForSlice(h.AncestryProof.HeaderBranch)
+		h.AncestryProof.FinalizedBlockRoot = removeLeadingZeroHash(h.AncestryProof.FinalizedBlockRoot)
+	}
+	h.ExecutionHeader.RemoveLeadingZeroHashes()
+	h.ExecutionBranch = removeLeadingZeroHashForSlice(h.ExecutionBranch)
 }
 
 func removeLeadingZeroHashForSlice(s []string) []string {
@@ -312,4 +290,17 @@ func removeLeadingZeroHashForSlice(s []string) []string {
 
 func removeLeadingZeroHash(s string) string {
 	return strings.Replace(s, "0x", "", 1)
+}
+
+type VersionedExecutionPayloadHeader struct {
+	Capella *ExecutionPayloadHeaderCapella `json:"Capella,omitempty"`
+	Deneb   *ExecutionPayloadHeaderDeneb   `json:"Deneb,omitempty"`
+}
+
+func (v *VersionedExecutionPayloadHeader) RemoveLeadingZeroHashes() {
+	if v.Capella != nil {
+		v.Capella.RemoveLeadingZeroHashes()
+	} else if v.Deneb != nil {
+		v.Deneb.RemoveLeadingZeroHashes()
+	}
 }
