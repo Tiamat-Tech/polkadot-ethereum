@@ -67,6 +67,7 @@ export class ERC20FromParachain<T extends EthereumProviderTypes> implements Tran
             feeTokenLocation?: any
             claimerLocation?: any
             contractCall?: ContractCall
+            volumeFee?: import("../../feeSchedule").VolumeFeeParams
         },
     ): Promise<DeliveryFee> {
         const assetHub = await this.context.assetHub()
@@ -237,6 +238,7 @@ export class ERC20FromParachain<T extends EthereumProviderTypes> implements Tran
                 ethChainId,
                 assetHubParaId,
                 sourceParachainImpl.parachainId,
+                sourceParachain.info.tokenSymbols,
                 sourceAccountHex,
                 beneficiaryAccount,
                 messageId,
@@ -289,6 +291,7 @@ export class ERC20FromParachain<T extends EthereumProviderTypes> implements Tran
                 feeTokenLocation?: any
                 claimerLocation?: any
                 contractCall?: ContractCall
+                volumeFee?: import("../../feeSchedule").VolumeFeeParams
             }
             tx?: {
                 claimerLocation?: any
