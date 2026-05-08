@@ -160,7 +160,7 @@ export function buildTransferXcmFromAssetHub(
             assets.push({
                 id: DOT_LOCATION,
                 fun: {
-                    Fungible: totalDOTFeeAmount + remoteEtherFeeAmount,
+                    Fungible: totalDOTFeeAmount,
                 },
             })
             assets.push({
