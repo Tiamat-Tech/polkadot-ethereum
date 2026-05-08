@@ -32,11 +32,12 @@ import {
 import { Context } from "../.."
 import { TransferInterface } from "./transferInterface"
 import { ensureValidationSuccess } from "../../utils"
+import { VolumeFeeParams } from "../../feeSchedule"
 import {
     buildContractCallHex,
     estimateFeesFromParachains,
-    MaxWeight,
     mockDeliveryFee,
+    queryXcmExecuteWeight,
     signAndSendTransfer,
     validateTransferFromParachain,
 } from "../../toEthereumSnowbridgeV2"
@@ -67,7 +68,7 @@ export class ERC20FromParachain<T extends EthereumProviderTypes> implements Tran
             feeTokenLocation?: any
             claimerLocation?: any
             contractCall?: ContractCall
-            volumeFee?: import("../../feeSchedule").VolumeFeeParams
+            volumeFee?: VolumeFeeParams
         },
     ): Promise<DeliveryFee> {
         const assetHub = await this.context.assetHub()
@@ -252,7 +253,10 @@ export class ERC20FromParachain<T extends EthereumProviderTypes> implements Tran
             throw new Error(`Fee token as ${fee.feeLocation} is not supported yet.`)
         }
         let tx: SubmittableExtrinsic<"promise", ISubmittableResult> =
-            parachain.tx.polkadotXcm.execute(xcm, MaxWeight)
+            parachain.tx.polkadotXcm.execute(
+                xcm,
+                await queryXcmExecuteWeight(sourceParachainImpl, sourceParachain, xcm),
+            )
 
         return {
             kind: "polkadot->ethereum",
@@ -291,7 +295,7 @@ export class ERC20FromParachain<T extends EthereumProviderTypes> implements Tran
                 feeTokenLocation?: any
                 claimerLocation?: any
                 contractCall?: ContractCall
-                volumeFee?: import("../../feeSchedule").VolumeFeeParams
+                volumeFee?: VolumeFeeParams
             }
             tx?: {
                 claimerLocation?: any

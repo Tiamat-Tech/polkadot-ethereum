@@ -29,11 +29,12 @@ import {
 import { Context } from "../.."
 import { TransferInterface } from "./transferInterface"
 import { ensureValidationSuccess } from "../../utils"
+import { VolumeFeeParams } from "../../feeSchedule"
 import {
     buildContractCallHex,
     estimateFeesFromAssetHub,
-    MaxWeight,
     mockDeliveryFee,
+    queryXcmExecuteWeight,
     signAndSendTransfer,
     validateTransferFromAssetHub,
 } from "../../toEthereumSnowbridgeV2"
@@ -63,7 +64,7 @@ export class PNAFromAH<T extends EthereumProviderTypes> implements TransferInter
             defaultFee?: bigint
             feeTokenLocation?: any
             contractCall?: ContractCall
-            volumeFee?: import("../../feeSchedule").VolumeFeeParams
+            volumeFee?: VolumeFeeParams
         },
     ): Promise<DeliveryFee> {
         const assetHub = await this.context.assetHub()
@@ -201,7 +202,10 @@ export class PNAFromAH<T extends EthereumProviderTypes> implements TransferInter
             throw new Error(`Fee token as ${fee.feeLocation} is not supported yet.`)
         }
         let tx: SubmittableExtrinsic<"promise", ISubmittableResult> =
-            parachain.tx.polkadotXcm.execute(xcm, MaxWeight)
+            parachain.tx.polkadotXcm.execute(
+                xcm,
+                await queryXcmExecuteWeight(sourceParachainImpl, sourceParachain, xcm),
+            )
 
         return {
             kind: "polkadot->ethereum",
@@ -240,7 +244,7 @@ export class PNAFromAH<T extends EthereumProviderTypes> implements TransferInter
                 feeTokenLocation?: any
                 claimerLocation?: any
                 contractCall?: ContractCall
-                volumeFee?: import("../../feeSchedule").VolumeFeeParams
+                volumeFee?: VolumeFeeParams
             }
             tx?: {
                 claimerLocation?: any

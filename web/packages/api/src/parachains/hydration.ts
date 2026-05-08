@@ -8,6 +8,10 @@ export class HydrationParachain extends ParachainBase {
         return undefined
     }
 
+    getMaxWeight(): { refTime: bigint; proofSize: bigint } {
+        return { refTime: 20_000_000_000n, proofSize: 500_000n }
+    }
+
     async getLocationBalance(location: any, account: string, _pnaAssetId?: any): Promise<bigint> {
         const paraAssetId = (
             await this.provider.query.assetRegistry.locationAssets(location)
@@ -91,12 +95,5 @@ export class HydrationParachain extends ParachainBase {
         exactAsset2Balance: bigint,
     ): Promise<bigint> {
         throw Error(`${this.specName} does not support.`)
-    }
-
-    getAssetHubPoolReserves(
-        _asset1: any,
-        _asset2: any,
-    ): Promise<{ reserve1: bigint; reserve2: bigint } | null> {
-        return Promise.resolve(null)
     }
 }
