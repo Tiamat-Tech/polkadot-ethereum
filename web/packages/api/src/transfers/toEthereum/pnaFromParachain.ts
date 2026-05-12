@@ -1,4 +1,3 @@
-import { ApiPromise } from "@polkadot/api"
 import { AddressOrPair, SignerOptions, SubmittableExtrinsic } from "@polkadot/api/types"
 import { ISubmittableResult } from "@polkadot/types/types"
 import { isHex, u8aToHex } from "@polkadot/util"
@@ -69,6 +68,7 @@ export class PNAFromParachain<T extends EthereumProviderTypes> implements Transf
             claimerLocation?: any
             contractCall?: ContractCall
             volumeFee?: VolumeFeeParams
+            accelerated?: boolean
         },
     ): Promise<DeliveryFee> {
         const assetHub = await this.context.assetHub()

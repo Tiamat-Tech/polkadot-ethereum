@@ -395,6 +395,7 @@ export const estimateEthereumExecutionFee = async <T extends EthereumProviderTyp
     options?: {
         contractCall?: ContractCall
         fillDeadlineBuffer?: bigint
+        accelerated?: boolean
     },
 ): Promise<bigint> => {
     const ethereum = await context.ethereum()
@@ -406,14 +407,30 @@ export const estimateEthereumExecutionFee = async <T extends EthereumProviderTyp
         throw Error(`No token ${tokenAddress} registered on ethereum chain ${registry.ethChainId}.`)
     }
 
-    // Calculate execution cost on ethereum
-    let ethereumChain = registry.ethereumChains[`ethereum_${registry.ethChainId}`]
-    let feeData = await context.ethereumProvider.getFeeData(ethereum)
-    let ethereumExecutionFee =
-        (feeData.gasPrice ?? 2_000_000_000n) *
-        ((tokenErcMetadata.deliveryGas ?? 80_000n) +
-            (ethereumChain.baseDeliveryGas ?? 120_000n) +
-            (options?.contractCall?.gas ?? 0n))
+    // Calculate execution cost on ethereum including:
+    // 1. the consensus update, which is the fiat-shamir submit (if accelerated) or two phase submit if not.
+    // 2. message verification
+    // 3. a static dispatch margin
+    // 4. token delivery
+    // 5. and the optional contract call.
+    // All should leave enough margin to make sure the relay is profitable even in worst case scenarios.
+    const ethereumChain = registry.ethereumChains[`ethereum_${registry.ethChainId}`]
+    const feeData = await context.ethereumProvider.getFeeData(ethereum)
+    const gasPrice = feeData.gasPrice ?? 2_000_000_000n
+    const twoPhaseSubmitGas = ethereumChain.twoPhaseSubmitGas ?? 1_000_000n
+    const submitFiatShamirGas = ethereumChain.submitFiatShamirGas ?? 2_000_000n
+    const consensusUpdateGas = options?.accelerated ? submitFiatShamirGas : twoPhaseSubmitGas
+    const messageVerificationGas = ethereumChain.baseVerificationGas ?? 120_000n
+    const dispatchGas = ethereumChain.baseDispatchGas ?? 80_000n
+    const tokenDeliveryGas = tokenErcMetadata.deliveryGas ?? 100_000n
+    const contractCallGas = options?.contractCall?.gas ?? 0n
+    const totalGas =
+        consensusUpdateGas +
+        messageVerificationGas +
+        dispatchGas +
+        tokenDeliveryGas +
+        contractCallGas
+    const ethereumExecutionFee = gasPrice * totalGas
     return ethereumExecutionFee
 }
 
@@ -432,6 +449,7 @@ export const estimateFeesFromAssetHub = async <T extends EthereumProviderTypes>(
         l2TransferGasLimit?: bigint
         fillDeadlineBuffer?: bigint
         volumeFee?: VolumeFeeParams
+        accelerated?: boolean
     },
     l2ChainId?: number,
     tokenAmount?: bigint,
@@ -654,6 +672,7 @@ export const estimateFeesFromParachains = async <T extends EthereumProviderTypes
         feeTokenLocation?: any
         contractCall?: ContractCall
         volumeFee?: VolumeFeeParams
+        accelerated?: boolean
     },
 ): Promise<DeliveryFee> => {
     const sourceParachain = registry.parachains[`polkadot_${sourceParaId}`]
@@ -1255,10 +1274,8 @@ export const validateTransferFromParachain = async <T extends EthereumProviderTy
         isEthToken && isAllEthFeePath
             ? findInBreakdownOrZero(fee.breakdown, "ethereumExecution", "ETH")
             : 0n
-    const extraDotOnSourceWithdraw =
-        isDotToken && sourceWithdrawsDot ? requiredDotFee : 0n
-    const requiredTokenAmount =
-        amount + extraEthOnSourceWithdraw + extraDotOnSourceWithdraw
+    const extraDotOnSourceWithdraw = isDotToken && sourceWithdrawsDot ? requiredDotFee : 0n
+    const requiredTokenAmount = amount + extraEthOnSourceWithdraw + extraDotOnSourceWithdraw
 
     const paraTotalNative = findTotalOrUndefined(fee, source.info.tokenSymbols)
     // When the bridged token is the parachain's native asset, the substrate
@@ -1324,7 +1341,7 @@ export const validateTransferFromParachain = async <T extends EthereumProviderTy
     // is the parachain's native asset — both costs are folded into the
     // token-balance check above.
     if (!isNativeBalance) {
-        const nativeFeeShare = isNativeFeePath ? paraTotalNative ?? 0n : 0n
+        const nativeFeeShare = isNativeFeePath ? (paraTotalNative ?? 0n) : 0n
         if (sourceExecutionFee + nativeFeeShare > nativeBalance) {
             logs.push({
                 kind: ValidationKind.Error,
@@ -1457,13 +1474,12 @@ export const validateTransferFromParachain = async <T extends EthereumProviderTy
                     findInBreakdownOrZero(fee.breakdown, "assetHubExecution", "DOT") +
                     findInBreakdownOrZero(fee.breakdown, "bridgeHubDelivery", "DOT") +
                     findInBreakdownOrZero(fee.breakdown, "ethereumExecution", "DOT")
-                const nativeReserveCheck =
-                    await checkNativeDotPoolLiquidityForParachainToEthereum(
-                        assetHubImpl,
-                        fee.feeLocation,
-                        requiredDotOut,
-                        source.info.tokenSymbols,
-                    )
+                const nativeReserveCheck = await checkNativeDotPoolLiquidityForParachainToEthereum(
+                    assetHubImpl,
+                    fee.feeLocation,
+                    requiredDotOut,
+                    source.info.tokenSymbols,
+                )
                 if (!nativeReserveCheck.ok) {
                     logs.push({
                         kind: ValidationKind.Error,
